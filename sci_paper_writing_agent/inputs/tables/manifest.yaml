@@ -1,0 +1,15 @@
+# Add one entry per research table. Example (uncomment and adapt):
+# tables:
+#   - id: T01
+#     file: prediction_performance.csv
+#     title: Cognitive prediction performance
+#     analysis: prediction
+#     grouping_columns: [outcome, modality, model, fold]
+#     metrics:
+#       - column: r
+#         meaning: Pearson correlation
+#         unit: proportion
+#       - column: r2
+#         meaning: Out-of-sample R-squared
+#         unit: proportion
+tables: []

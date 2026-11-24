@@ -1,0 +1,14 @@
+cd paperkit
+bash setup.sh
+For an existing project, run UPDATE_CODE=1 bash setup.sh. Your paper.yaml is never overwritten, so add the introduction section by hand
+
+source .venv/bin/activate
+
+
+bash publish.sh "Initial commit"
+
+paperkit start
+
+
+
+

@@ -1,0 +1,20 @@
+# Which provider and model each agent uses. Read at start-up; `paperkit ping` shows the result.
+# For one agent the order is: its own entry below, then PAPERKIT_PROVIDER and PAPERKIT_MODEL from the
+# environment or .env, then the provider on the next line with its built-in default model.
+provider: anthropic            # anthropic | nvidia
+agents:
+  planner: {model: null}
+  writer: {model: null}
+  reviewer: {model: null}
+  wiki: {model: null}
+  literature: {model: null}
+  rules: {model: null}
+  facts: {model: null}
+
+# Example: free NVIDIA endpoints for planning and writing, a different model family for the review.
+# Copy each model ID from the model's page on build.nvidia.com; the catalogue changes.
+# provider: nvidia
+# agents:
+#   planner: {model: nvidia/nemotron-3-super-120b-a12b}
+#   writer: {model: nvidia/nemotron-3-super-120b-a12b}
+#   reviewer: {provider: anthropic, model: claude-sonnet-5-5}
