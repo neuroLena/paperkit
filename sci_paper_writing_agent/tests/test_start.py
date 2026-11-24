@@ -8,7 +8,7 @@ import stat
 
 import pytest
 
-from paperkit import agents, dryrun, env, orchestrator, preflight, wizard
+from paperkit import agents, dryrun, env, extract, orchestrator, preflight, wizard
 from paperkit.__main__ import main
 from paperkit.schemas import Claim, ClaimTable
 from paperkit.validators import blocking, check_claims, run_gates
@@ -280,4 +280,94 @@ def test_cli_finds_the_project_from_the_repository_folder(fresh, capsys):
     assert main(["--root", str(fresh.parent), "status"]) == 0
     assert "discussion: NEW" in capsys.readouterr().out
     assert main(["--root", str(fresh.parent), "check"]) == 1           # the placeholders are still there
+
+
+RESULTS_TEXT = """# Results
+
+We found a positive association between X and Y (r = 0.31, 95% CI [0.22, 0.40]) among n = 412 participants in the sample.
+The association was similar after adjustment for age (r = 0.29, 95% CI [0.20, 0.38]) and weaker in the younger group.
+"""
+
+
+def fake_model(facts=(), messages=()):
+    """A model that answers the two drafting requests with prepared text."""
+    def llm(system, user, schema):
+        if schema is extract.FactList:
+            return extract.FactList(facts=list(facts))
+        if schema is extract.MessageList:
+            return extract.MessageList(messages=list(messages))
+        raise AssertionError(schema)
+    return llm
+
+
+def test_facts_are_drafted_only_from_text_that_is_really_there(fresh):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(facts=["r = 0.31, 95% CI [0.22, 0.40]", "n = 412", "r  =  0.29", "n = 412",
+                                   "r = 0.99, invented", "no number here"])
+    got = extract.extract_facts(fresh)
+    assert [(r["id"], r["text"], r["source"]) for r in got["rows"]] == [
+        ("F1", "r = 0.31, 95% CI [0.22, 0.40]", "Results, line 3"),
+        ("F2", "n = 412", "Results, line 3"),
+        ("F3", "r = 0.29", "Results, line 4")]
+    assert got["dropped"] == ["r = 0.99, invented", "no number here"]
+    assert json.loads((fresh / "facts" / "facts.json").read_text(encoding="utf-8"))["F3"]["text"] == "r = 0.29"
+    assert status(fresh)["facts"] is True
+
+
+def test_real_facts_and_messages_are_never_replaced_unless_forced(fresh):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    (fresh / "inputs" / "facts.csv").write_text("id,text,source\nF1,r = 0.31,Table 2\n", encoding="utf-8")
+    (fresh / "inputs" / "key_messages.md").write_text("# Key messages\n\n- X tracks Y\n", encoding="utf-8")
+    agents.LLM = fake_model(facts=["n = 412"], messages=["Y varies by age group."])
+    with pytest.raises(extract.Skip):
+        extract.extract_facts(fresh)
+    with pytest.raises(extract.Skip):
+        extract.extract_key_messages(fresh)
+    assert "r = 0.31" in (fresh / "inputs" / "facts.csv").read_text(encoding="utf-8")
+    extract.extract_facts(fresh, force=True)
+    assert "r = 0.31" not in (fresh / "inputs" / "facts.csv").read_text(encoding="utf-8")
+
+
+def test_nothing_is_drafted_from_a_placeholder_results_section(fresh):
+    def boom(*args):
+        raise AssertionError("the model must not be called")
+
+    agents.LLM = boom
+    with pytest.raises(ValueError, match="results.md"):
+        extract.extract_facts(fresh)
+    with pytest.raises(ValueError, match="results.md"):
+        extract.extract_key_messages(fresh)
+
+
+def test_key_messages_drop_digits_and_causal_wording(fresh):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(messages=["X is associated with Y in this sample.", "The correlation is 0.31 overall.",
+                                      "X causes Y.", "- Y varies by age group.", "X is associated with Y in this sample."])
+    got = extract.extract_key_messages(fresh)
+    assert got["messages"] == ["X is associated with Y in this sample.", "Y varies by age group."]
+    assert [d.split(" (")[1] for d in got["dropped"]] == ["has a digit)", "causal wording in an observational study)"]
+    assert len(preflight.content_lines(fresh / "inputs" / "key_messages.md")) == 2
+    assert status(fresh)["key_messages"] is True
+
+
+def test_extract_command_drafts_both_files(fresh, capsys):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(facts=["n = 412"], messages=["Y varies by age group."])
+    assert main(["--root", str(fresh), "extract"]) == 0
+    out = capsys.readouterr().out
+    assert "F1   n = 412   (Results, line 3)" in out and "Read both files" in out
+    assert main(["--root", str(fresh), "extract"]) == 0                  # both are real now: skipped, not an error
+    assert out.count("skipped") == 0 and capsys.readouterr().out.count("skipped") == 2
+
+
+def test_start_screen_offers_to_draft_facts_and_messages(fresh):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(facts=["n = 412"], messages=["Y varies by age group."])
+    checks = {c.key: c for c in preflight.check_inputs(fresh)}
+    ui, printed = scripted(["x", "y"])                                   # draft them, and yes to the API call
+    wizard.fill(ui, fresh, checks["facts"])
+    ui, printed = scripted(["x", "y"])
+    wizard.fill(ui, fresh, checks["key_messages"])
+    assert status(fresh)["facts"] is True and status(fresh)["key_messages"] is True
+    assert any("a model drafted them" in row for row in printed)
 

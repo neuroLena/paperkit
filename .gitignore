@@ -12,3 +12,9 @@ state/log/
 .papers/
 .writing_guides/
 .cache/
+
+# Added by scaffold.py
+inputs/
+drafts/
+state/
+facts/

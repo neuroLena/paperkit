@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, facts, orchestrator, preflight, zotero
+from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, zotero
 from .schemas import ClaimTable, Issue
 from .validators import blocking
 
@@ -152,11 +152,14 @@ def strip_title(text: str) -> str:
 def fill_text(ui: UI, root: Path, check: preflight.Check) -> None:
     rel, heading, as_list = TEXT_INPUTS[check.key]
     path = root / rel
-    choice = ui.choose("How do you want to fill it in?", {
+    options = {
         "p": "import from a file (.md .txt .docx .pdf)",
         "t": "type them here, one per line" if as_list else "paste the text here",
         "e": "open the file in an editor",
-        "s": "skip for now"}, default="s")
+        "s": "skip for now"}
+    if check.key == "key_messages":
+        options = {"x": "draft them from the Results section with the model (calls the API; you review them)", **options}
+    choice = ui.choose("How do you want to fill it in?", options, default="s")
     if choice == "s":
         return
     if choice == "e":
@@ -164,6 +167,9 @@ def fill_text(ui: UI, root: Path, check: preflight.Check) -> None:
             ui.out("No editor found. Set the EDITOR variable, or edit the file yourself.")
         return
     if check.ok and not ui.confirm("This replaces the current content. Continue?", False):
+        return
+    if choice == "x":
+        draft_with_model(ui, root, "key-messages")
         return
     if choice == "p":
         try:
@@ -227,8 +233,14 @@ def fill_facts(ui: UI, root: Path, check: preflight.Check) -> None:
         "i": "import a CSV with the columns id, text, source",
         "e": "open the file in an editor",
         "b": "rebuild facts/facts.json from the file as it is",
+        "x": "draft them from the Results section with the model (calls the API; you review them)",
         "s": "skip for now"}, default="s")
     if choice == "s":
+        return
+    if choice == "x":
+        if any("EXAMPLE" not in r["text"] for r in rows) and not ui.confirm("This replaces the facts now in the file. Continue?", False):
+            return
+        draft_with_model(ui, root, "facts")
         return
     if choice == "a":
         real = [r for r in rows if "EXAMPLE" not in r["text"]]
@@ -259,6 +271,16 @@ def fill_facts(ui: UI, root: Path, check: preflight.Check) -> None:
         ui.out(f"{len(built)} fact(s) -> facts/facts.json")
     except (OSError, ValueError, KeyError) as exc:
         ui.out(f"facts/facts.json was not rebuilt: {exc}")
+
+
+def draft_with_model(ui: UI, root: Path, what: str) -> None:
+    """Drafts facts.csv or key_messages.md from the Results section, then shows what was kept and what was left out."""
+    if not _confirm_api(ui, "facts" if what == "facts" else "planner"):
+        return
+    try:
+        extract.run(root, what, force=True, out=ui.out)
+    except Exception as exc:      # a provider error must not close the screen
+        ui.out(f"That step failed: {type(exc).__name__}: {' '.join(str(exc).split())[:300]}")
 
 
 def fill_bib(ui: UI, root: Path, check: preflight.Check) -> None:

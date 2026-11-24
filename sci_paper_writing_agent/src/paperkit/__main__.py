@@ -9,7 +9,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, facts, orchestrator, preflight, wiki, wizard
+from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, wiki, wizard
 from .schemas import Issue
 from .validators import blocking
 
@@ -62,6 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("build", help="build build/paper.md, the .docx and the report")
     sub.add_parser("wiki-lint", help="check the wiki pages")
     sub.add_parser("ping", help="show which model each agent uses and send each one a small test request")
+    ext = sub.add_parser("extract", help="draft facts.csv and key_messages.md from the Results section (calls the model)")
+    ext.add_argument("what", nargs="?", choices=["all", "facts", "key-messages"], default="all")
+    ext.add_argument("--force", action="store_true", help="replace the file even if it already has real content")
     plan = sub.add_parser("plan", help="build the claim table")
     plan.add_argument("section")
     plan.add_argument("--force", action="store_true", help="call the model even if required inputs are missing")
@@ -83,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         for kind in agents.PIPELINE_AGENTS:
             agents.route(kind)
     except (ValueError, OSError) as exc:
-        if cmd in ("plan", "run", "ping"):               # the other commands do not call a model
+        if cmd in ("plan", "run", "ping", "extract"):    # the other commands do not call a model
             print(f"Model configuration is not valid: {exc}")
             return 2
 
@@ -102,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         for kinds, provider, model, result in rows:
             print(f"{provider:<11}{model}  ({kinds}): {result}")
         return 0 if all(result == "ok" for *_, result in rows) else 1
+    if cmd == "extract":
+        return extract.run(root, args.what, args.force)
     if cmd == "dry-run":
         result = dryrun.dry_run(root, args.section)
         print(dryrun.summary(result))

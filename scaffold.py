@@ -96,7 +96,9 @@ Menu 9 on the start screen does the same and can save the provider, the model an
 
 1. Fill in `paper.yaml` and the files in `inputs/`.
 2. Set up Better BibTeX auto-export from Zotero to `refs/library.bib`.
-3. `paperkit facts` builds `facts/facts.json` from `inputs/facts.csv`.
+3. `paperkit facts` builds `facts/facts.json` from `inputs/facts.csv`. With no tables, `paperkit extract` drafts `inputs/facts.csv`
+   and `inputs/key_messages.md` from the Results section (only while they are empty or still the scaffold's examples;
+   `--force` replaces them). Every fact must appear word for word in Results or Methods. Read both files afterwards.
 4. `paperkit plan introduction` (and `paperkit plan discussion`) builds the claim table in `state/claims/<section>.json`.
 5. Read and correct the table, then run `paperkit approve introduction`. This is the one required manual check for each section.
 6. `paperkit run introduction` runs the writer -> gates -> reviewer loop and writes `drafts/introduction.md`.
@@ -1430,7 +1432,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, facts, orchestrator, preflight, wiki, wizard
+from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, wiki, wizard
 from .schemas import Issue
 from .validators import blocking
 
@@ -1483,6 +1485,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("build", help="build build/paper.md, the .docx and the report")
     sub.add_parser("wiki-lint", help="check the wiki pages")
     sub.add_parser("ping", help="show which model each agent uses and send each one a small test request")
+    ext = sub.add_parser("extract", help="draft facts.csv and key_messages.md from the Results section (calls the model)")
+    ext.add_argument("what", nargs="?", choices=["all", "facts", "key-messages"], default="all")
+    ext.add_argument("--force", action="store_true", help="replace the file even if it already has real content")
     plan = sub.add_parser("plan", help="build the claim table")
     plan.add_argument("section")
     plan.add_argument("--force", action="store_true", help="call the model even if required inputs are missing")
@@ -1504,7 +1509,7 @@ def main(argv: list[str] | None = None) -> int:
         for kind in agents.PIPELINE_AGENTS:
             agents.route(kind)
     except (ValueError, OSError) as exc:
-        if cmd in ("plan", "run", "ping"):               # the other commands do not call a model
+        if cmd in ("plan", "run", "ping", "extract"):    # the other commands do not call a model
             print(f"Model configuration is not valid: {exc}")
             return 2
 
@@ -1523,6 +1528,8 @@ def main(argv: list[str] | None = None) -> int:
         for kinds, provider, model, result in rows:
             print(f"{provider:<11}{model}  ({kinds}): {result}")
         return 0 if all(result == "ok" for *_, result in rows) else 1
+    if cmd == "extract":
+        return extract.run(root, args.what, args.force)
     if cmd == "dry-run":
         result = dryrun.dry_run(root, args.section)
         print(dryrun.summary(result))
@@ -2226,7 +2233,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, facts, orchestrator, preflight, zotero
+from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, zotero
 from .schemas import ClaimTable, Issue
 from .validators import blocking
 
@@ -2363,11 +2370,14 @@ def strip_title(text: str) -> str:
 def fill_text(ui: UI, root: Path, check: preflight.Check) -> None:
     rel, heading, as_list = TEXT_INPUTS[check.key]
     path = root / rel
-    choice = ui.choose("How do you want to fill it in?", {
+    options = {
         "p": "import from a file (.md .txt .docx .pdf)",
         "t": "type them here, one per line" if as_list else "paste the text here",
         "e": "open the file in an editor",
-        "s": "skip for now"}, default="s")
+        "s": "skip for now"}
+    if check.key == "key_messages":
+        options = {"x": "draft them from the Results section with the model (calls the API; you review them)", **options}
+    choice = ui.choose("How do you want to fill it in?", options, default="s")
     if choice == "s":
         return
     if choice == "e":
@@ -2375,6 +2385,9 @@ def fill_text(ui: UI, root: Path, check: preflight.Check) -> None:
             ui.out("No editor found. Set the EDITOR variable, or edit the file yourself.")
         return
     if check.ok and not ui.confirm("This replaces the current content. Continue?", False):
+        return
+    if choice == "x":
+        draft_with_model(ui, root, "key-messages")
         return
     if choice == "p":
         try:
@@ -2438,8 +2451,14 @@ def fill_facts(ui: UI, root: Path, check: preflight.Check) -> None:
         "i": "import a CSV with the columns id, text, source",
         "e": "open the file in an editor",
         "b": "rebuild facts/facts.json from the file as it is",
+        "x": "draft them from the Results section with the model (calls the API; you review them)",
         "s": "skip for now"}, default="s")
     if choice == "s":
+        return
+    if choice == "x":
+        if any("EXAMPLE" not in r["text"] for r in rows) and not ui.confirm("This replaces the facts now in the file. Continue?", False):
+            return
+        draft_with_model(ui, root, "facts")
         return
     if choice == "a":
         real = [r for r in rows if "EXAMPLE" not in r["text"]]
@@ -2470,6 +2489,16 @@ def fill_facts(ui: UI, root: Path, check: preflight.Check) -> None:
         ui.out(f"{len(built)} fact(s) -> facts/facts.json")
     except (OSError, ValueError, KeyError) as exc:
         ui.out(f"facts/facts.json was not rebuilt: {exc}")
+
+
+def draft_with_model(ui: UI, root: Path, what: str) -> None:
+    """Drafts facts.csv or key_messages.md from the Results section, then shows what was kept and what was left out."""
+    if not _confirm_api(ui, "facts" if what == "facts" else "planner"):
+        return
+    try:
+        extract.run(root, what, force=True, out=ui.out)
+    except Exception as exc:      # a provider error must not close the screen
+        ui.out(f"That step failed: {type(exc).__name__}: {' '.join(str(exc).split())[:300]}")
 
 
 def fill_bib(ui: UI, root: Path, check: preflight.Check) -> None:
@@ -2794,7 +2823,7 @@ import stat
 
 import pytest
 
-from paperkit import agents, dryrun, env, orchestrator, preflight, wizard
+from paperkit import agents, dryrun, env, extract, orchestrator, preflight, wizard
 from paperkit.__main__ import main
 from paperkit.schemas import Claim, ClaimTable
 from paperkit.validators import blocking, check_claims, run_gates
@@ -3066,6 +3095,96 @@ def test_cli_finds_the_project_from_the_repository_folder(fresh, capsys):
     assert main(["--root", str(fresh.parent), "status"]) == 0
     assert "discussion: NEW" in capsys.readouterr().out
     assert main(["--root", str(fresh.parent), "check"]) == 1           # the placeholders are still there
+
+
+RESULTS_TEXT = """# Results
+
+We found a positive association between X and Y (r = 0.31, 95% CI [0.22, 0.40]) among n = 412 participants in the sample.
+The association was similar after adjustment for age (r = 0.29, 95% CI [0.20, 0.38]) and weaker in the younger group.
+"""
+
+
+def fake_model(facts=(), messages=()):
+    """A model that answers the two drafting requests with prepared text."""
+    def llm(system, user, schema):
+        if schema is extract.FactList:
+            return extract.FactList(facts=list(facts))
+        if schema is extract.MessageList:
+            return extract.MessageList(messages=list(messages))
+        raise AssertionError(schema)
+    return llm
+
+
+def test_facts_are_drafted_only_from_text_that_is_really_there(fresh):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(facts=["r = 0.31, 95% CI [0.22, 0.40]", "n = 412", "r  =  0.29", "n = 412",
+                                   "r = 0.99, invented", "no number here"])
+    got = extract.extract_facts(fresh)
+    assert [(r["id"], r["text"], r["source"]) for r in got["rows"]] == [
+        ("F1", "r = 0.31, 95% CI [0.22, 0.40]", "Results, line 3"),
+        ("F2", "n = 412", "Results, line 3"),
+        ("F3", "r = 0.29", "Results, line 4")]
+    assert got["dropped"] == ["r = 0.99, invented", "no number here"]
+    assert json.loads((fresh / "facts" / "facts.json").read_text(encoding="utf-8"))["F3"]["text"] == "r = 0.29"
+    assert status(fresh)["facts"] is True
+
+
+def test_real_facts_and_messages_are_never_replaced_unless_forced(fresh):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    (fresh / "inputs" / "facts.csv").write_text("id,text,source\nF1,r = 0.31,Table 2\n", encoding="utf-8")
+    (fresh / "inputs" / "key_messages.md").write_text("# Key messages\n\n- X tracks Y\n", encoding="utf-8")
+    agents.LLM = fake_model(facts=["n = 412"], messages=["Y varies by age group."])
+    with pytest.raises(extract.Skip):
+        extract.extract_facts(fresh)
+    with pytest.raises(extract.Skip):
+        extract.extract_key_messages(fresh)
+    assert "r = 0.31" in (fresh / "inputs" / "facts.csv").read_text(encoding="utf-8")
+    extract.extract_facts(fresh, force=True)
+    assert "r = 0.31" not in (fresh / "inputs" / "facts.csv").read_text(encoding="utf-8")
+
+
+def test_nothing_is_drafted_from_a_placeholder_results_section(fresh):
+    def boom(*args):
+        raise AssertionError("the model must not be called")
+
+    agents.LLM = boom
+    with pytest.raises(ValueError, match="results.md"):
+        extract.extract_facts(fresh)
+    with pytest.raises(ValueError, match="results.md"):
+        extract.extract_key_messages(fresh)
+
+
+def test_key_messages_drop_digits_and_causal_wording(fresh):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(messages=["X is associated with Y in this sample.", "The correlation is 0.31 overall.",
+                                      "X causes Y.", "- Y varies by age group.", "X is associated with Y in this sample."])
+    got = extract.extract_key_messages(fresh)
+    assert got["messages"] == ["X is associated with Y in this sample.", "Y varies by age group."]
+    assert [d.split(" (")[1] for d in got["dropped"]] == ["has a digit)", "causal wording in an observational study)"]
+    assert len(preflight.content_lines(fresh / "inputs" / "key_messages.md")) == 2
+    assert status(fresh)["key_messages"] is True
+
+
+def test_extract_command_drafts_both_files(fresh, capsys):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(facts=["n = 412"], messages=["Y varies by age group."])
+    assert main(["--root", str(fresh), "extract"]) == 0
+    out = capsys.readouterr().out
+    assert "F1   n = 412   (Results, line 3)" in out and "Read both files" in out
+    assert main(["--root", str(fresh), "extract"]) == 0                  # both are real now: skipped, not an error
+    assert out.count("skipped") == 0 and capsys.readouterr().out.count("skipped") == 2
+
+
+def test_start_screen_offers_to_draft_facts_and_messages(fresh):
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(facts=["n = 412"], messages=["Y varies by age group."])
+    checks = {c.key: c for c in preflight.check_inputs(fresh)}
+    ui, printed = scripted(["x", "y"])                                   # draft them, and yes to the API call
+    wizard.fill(ui, fresh, checks["facts"])
+    ui, printed = scripted(["x", "y"])
+    wizard.fill(ui, fresh, checks["key_messages"])
+    assert status(fresh)["facts"] is True and status(fresh)["key_messages"] is True
+    assert any("a model drafted them" in row for row in printed)
 
 '''
 
@@ -3459,6 +3578,208 @@ def test_menu_switches_to_nvidia_saves_the_key_and_pings(project, monkeypatch):
 '''
 
 
+FILES['src/paperkit/extract.py'] = r'''
+"""Draft the two inputs that come straight from the Results section: facts.csv and key_messages.md.
+
+The model proposes; code verifies. A fact is kept only if its text appears word for word in the Results or
+Methods text, and its source (file and line) is worked out here, never by the model. A key message is kept
+only if it has no digit and, for an observational study, no causal wording. Real content is never replaced
+unless `force` is set. Nothing is approved here: a person reads the result, as with the claim table.
+"""
+from __future__ import annotations
+
+import csv
+import re
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, Field
+
+from . import agents, facts, preflight
+from .schemas import PaperSpec
+from .validators.language import CAUSAL
+
+SOURCES = (("results", "Results"), ("methods", "Methods"))
+MAX_MESSAGES = 5
+
+FACTS = """You list the numbers that the Discussion of a paper may cite, taken from its Results and Methods text. You write no prose.
+
+Return every statistic as one string copied character for character from the text, with its label, for example "r = 0.31, 95% CI [0.22, 0.40]" or "n = 412".
+- One statistic per string. Keep a value and its interval or p-value together when the text prints them together.
+- Never compute, round, convert, combine or reformat a number. If you cannot copy it exactly, leave it out.
+- Skip years, citation numbers, table and figure numbers, and page numbers."""
+
+MESSAGES = """You draft the key messages of a scientific paper from its Results text.
+
+Return 3 to 5 messages. Each is one complete sentence that says what was found and in whom or what.
+- No digit anywhere: write "was associated with higher", not the number.
+- Say only what the results support. If the study design is observational, use no causal wording.
+- Do not list limitations: they are kept elsewhere.
+- Do not say one message twice in different words."""
+
+
+class FactList(BaseModel):
+    facts: list[str] = Field(description="Each statistic exactly as printed in the text, with its label")
+
+
+class MessageList(BaseModel):
+    messages: list[str] = Field(description="Three to five one-sentence key messages with no digits")
+
+
+class Skip(Exception):
+    """The file already has real content. Not an error."""
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def facts_are_default(root: Path) -> bool:
+    """inputs/facts.csv is missing, empty, or holds only the scaffold's EXAMPLE rows."""
+    path = Path(root) / "inputs" / "facts.csv"
+    if not path.is_file():
+        return True
+    try:
+        rows = preflight.read_facts_csv(path)
+    except (ValueError, csv.Error, UnicodeDecodeError):
+        return False                       # a file somebody wrote and broke: leave it alone
+    return all("EXAMPLE" in row["text"] for row in rows)
+
+
+def messages_are_default(root: Path) -> bool:
+    return not preflight.content_lines(Path(root) / "inputs" / "key_messages.md")
+
+
+def _read(root: Path, name: str) -> str:
+    path = Path(root) / "inputs" / f"{name}.md"
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def _results(root: Path) -> None:
+    words = sum(len(line.split()) for line in preflight.content_lines(Path(root) / "inputs" / "results.md"))
+    if words < preflight.MIN_WORDS:
+        raise ValueError("Fill in inputs/results.md first: the Results section is what these are drafted from.")
+
+
+def _where(texts: dict[str, str], fact: str) -> str | None:
+    """'Results, line 7' for the first place the fact appears (spaces ignored), or None if it is not there."""
+    for name, label in SOURCES:
+        for number, line in enumerate(texts[name].splitlines(), 1):
+            if fact in _norm(line):
+                return f"{label}, line {number}"
+        if fact in _norm(texts[name]):
+            return label                   # the fact runs over a line break
+    return None
+
+
+def _ask(root: Path, kind: str, system: str, user: str, schema: type[BaseModel]) -> BaseModel:
+    agents.LOG_DIR = Path(root) / "state" / "log"
+    return agents._ask(kind, system, user, schema)
+
+
+def extract_facts(root: str | Path, force: bool = False) -> dict:
+    """inputs/facts.csv and facts/facts.json from the Results and Methods text."""
+    root = Path(root)
+    if not force and not facts_are_default(root):
+        raise Skip("inputs/facts.csv already has facts (repeat with --force to replace them)")
+    _results(root)
+    texts = {name: _read(root, name) for name, _ in SOURCES}
+    user = "\n\n".join(agents._tag(name, texts[name]) for name, _ in SOURCES)
+    proposed = _ask(root, "facts", FACTS, user, FactList).facts
+    rows, dropped, seen = [], [], set()
+    for raw in proposed:
+        text = _norm(raw)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        place = _where(texts, text)
+        if place is None or not re.search(r"\d", text):
+            dropped.append(text)           # not in the text, or not a number: never trusted
+            continue
+        rows.append({"id": f"F{len(rows) + 1}", "text": text, "source": place})
+    if not rows:
+        raise ValueError("None of the proposed facts could be found word for word in the text.")
+    path = root / "inputs" / "facts.csv"
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "text", "source"])
+        writer.writeheader()
+        writer.writerows(rows)
+    facts.from_csv(path, root / "facts" / "facts.json")
+    return {"rows": rows, "dropped": dropped}
+
+
+def _design(root: Path) -> str:
+    try:
+        return PaperSpec.model_validate(yaml.safe_load((root / "paper.yaml").read_text(encoding="utf-8"))).design
+    except Exception:
+        return "observational"             # the stricter reading
+
+
+def extract_key_messages(root: str | Path, force: bool = False) -> dict:
+    """inputs/key_messages.md from the Results text."""
+    root = Path(root)
+    if not force and not messages_are_default(root):
+        raise Skip("inputs/key_messages.md already has messages (repeat with --force to replace them)")
+    _results(root)
+    design = _design(root)
+    user = "\n\n".join([agents._tag("study_design", design), agents._tag("results", _read(root, "results"))])
+    proposed = _ask(root, "planner", MESSAGES, user, MessageList).messages
+    kept, dropped = [], []
+    for raw in proposed:
+        text = _norm(raw).lstrip("-*• ").strip()
+        if not text:
+            continue
+        why = ("has a digit" if re.search(r"\d", text)
+               else "causal wording in an observational study" if design == "observational" and CAUSAL.search(text)
+               else "")
+        if why:
+            dropped.append(f"{text} ({why})")
+        elif text not in kept:
+            kept.append(text)
+    kept = kept[:MAX_MESSAGES]
+    if not kept:
+        raise ValueError("None of the proposed messages passed the checks.")
+    (root / "inputs" / "key_messages.md").write_text(
+        "# Key messages\n\n## Drafted by the model from inputs/results.md: review and edit before planning\n\n"
+        + "\n".join(f"- {text}" for text in kept) + "\n", encoding="utf-8")
+    return {"messages": kept, "dropped": dropped}
+
+
+def run(root: str | Path, what: str = "all", force: bool = False, out=print) -> int:
+    """`paperkit extract`: prints what was written and what was thrown away. Exit code 1 if a step failed."""
+    root, code = Path(root), 0
+    if what in ("all", "facts"):
+        try:
+            got = extract_facts(root, force)
+            out(f"facts: {len(got['rows'])} -> inputs/facts.csv and facts/facts.json")
+            for r in got["rows"]:
+                out(f"  {r['id']:<5}{r['text']}   ({r['source']})")
+            for text in got["dropped"]:
+                out(f"  not in the text, left out: {text}")
+        except Skip as why:
+            out(f"facts: skipped, {why}")
+        except Exception as exc:               # a missing key or a provider error: say so, do not crash
+            out(f"facts: {type(exc).__name__}: {' '.join(str(exc).split())[:300]}")
+            code = 1
+    if what in ("all", "key-messages"):
+        try:
+            got = extract_key_messages(root, force)
+            out(f"key messages: {len(got['messages'])} -> inputs/key_messages.md")
+            for text in got["messages"]:
+                out(f"  - {text}")
+            for text in got["dropped"]:
+                out(f"  left out: {text}")
+        except Skip as why:
+            out(f"key messages: skipped, {why}")
+        except Exception as exc:
+            out(f"key messages: {type(exc).__name__}: {' '.join(str(exc).split())[:300]}")
+            code = 1
+    if code == 0:
+        out("Read both files and correct them before `paperkit plan`: a model drafted them.")
+    return code
+'''
+
+
 ENV_TEXT = """# GitHub (used by publish.sh)
 GITHUB_USER=
 GITHUB_TOKEN=
@@ -3478,6 +3799,7 @@ IGNORE_RULES = [
     ".env", ".venv/", "__pycache__/", "*.egg-info/", ".pytest_cache/",
     ".DS_Store", "Thumbs.db", "~$*",
     "build/", "state/log/", ".papers/", ".writing_guides/", ".cache/",
+    "inputs/", "drafts/", "state/", "facts/", 
 ]
 
 

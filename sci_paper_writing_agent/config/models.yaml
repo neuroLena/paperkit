@@ -13,8 +13,13 @@ agents:
 
 # Example: free NVIDIA endpoints for planning and writing, a different model family for the review.
 # Copy each model ID from the model's page on build.nvidia.com; the catalogue changes.
-# provider: nvidia
-# agents:
-#   planner: {model: nvidia/nemotron-3-super-120b-a12b}
-#   writer: {model: nvidia/nemotron-3-super-120b-a12b}
-#   reviewer: {provider: anthropic, model: claude-sonnet-5-5}
+provider: nvidia
+
+agents:
+  planner:    {model: "z-ai/glm-5.3-flash"}
+  writer:     {model: "z-ai/glm-5.3-flash"}
+  reviewer:   {model: "z-ai/glm-5.3-flash"}
+  wiki:       {model: "z-ai/glm-5.3-flash"}
+  literature: {model: "z-ai/glm-5.3-flash"}
+  rules:      {model: "z-ai/glm-5.3-flash"}
+  facts:      {model: "z-ai/glm-5.3-flash"}
