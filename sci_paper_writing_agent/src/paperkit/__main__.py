@@ -9,7 +9,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, wiki, wizard
+from . import agents, build, dryrun, env, evidence, extract, facts, orchestrator, preflight, wiki, wizard
 from .ingestion import rules_ingest
 from .schemas import Issue
 from .validators import blocking
@@ -76,6 +76,15 @@ def main(argv: list[str] | None = None) -> int:
     rul.add_argument("ids", nargs="*", help="rule ids such as R3 R7, for approve and reject")
     rul.add_argument("--all", action="store_true", help="approve every candidate")
     rul.add_argument("--fresh", action="store_true", help="ask the model again instead of using saved answers")
+    evi = sub.add_parser("evidence", help="search the literature for a section's claims: support, contradiction, "
+                                          "other interpretations")
+    evi.add_argument("action", choices=["search", "list", "review", "accept", "reject", "apply"],
+                     help="search calls the model and Semantic Scholar; review asks about each suggestion in turn")
+    evi.add_argument("section", nargs="?", help="may be left out when paper.yaml has one section")
+    evi.add_argument("ids", nargs="*", help="suggestion ids such as E2 A1, for accept and reject")
+    evi.add_argument("--fresh", action="store_true", help="search and ask again instead of using saved answers")
+    evi.add_argument("--add-to-library", action="store_true",
+                     help="append accepted papers to refs/library.bib (only if Zotero does not write that file)")
     plan = sub.add_parser("plan", help="build the claim table")
     plan.add_argument("section")
     plan.add_argument("--force", action="store_true", help="call the model even if required inputs are missing")
@@ -97,7 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         for kind in agents.PIPELINE_AGENTS:
             agents.route(kind)
     except (ValueError, OSError) as exc:
-        if cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action == "extract"):
+        if (cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action == "extract")
+                or (cmd == "evidence" and args.action == "search")):
             print(f"Model configuration is not valid: {exc}")
             return 2
 
@@ -126,6 +136,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if dryrun.passed(result) else 1
 
     p = orchestrator.Project(root)
+    if cmd == "evidence":
+        names = [sec.id for sec in p.spec.sections]
+        section, ids = args.section, list(args.ids)
+        if section not in names and len(names) == 1:       # one section: its name may be left out
+            section, ids = names[0], ([section] if section else []) + ids
+        if section not in names:
+            print(f"Name the section: paperkit evidence {args.action} <section>, one of: {', '.join(names)}")
+            return 1
+        return evidence.run(root, args.action, section, ids, args.fresh, args.add_to_library, out=_say)
     if cmd == "status":
         status = p.status()
         for sec in p.spec.sections:

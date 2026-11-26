@@ -127,6 +127,57 @@ def test_each_stage_is_reported_while_it_runs(project):
     assert "no rounds left" in "\n".join(said) and said[-1].endswith("-> state/reviews/discussion.open.json")
 
 
+PAD = " ".join(["word"] * 60)
+TOO_LONG = """## Principal findings
+
+We observed an association between X and Y ({{F1}}) among {{F2}} participants. PAD <!-- C1 -->
+
+We observed it again ({{F1}}) in order to be sure. PAD <!-- C1 -->
+
+## Interpretation
+
+This suggests that X tracks Y, consistent with earlier work [@smith2020]. PAD <!-- C2 -->
+
+This reading assumes that measurement error was unrelated to Y, which we did not test. PAD <!-- C3 -->
+""".replace("PAD", PAD)
+
+
+def test_a_draft_that_is_too_long_gets_targets_and_the_report_says_where_to_shorten(project, tmp_path):
+    prompts = []
+
+    def llm(system, user, schema):
+        if schema is ClaimList:
+            return ClaimList(claims=CLAIMS)
+        prompts.append(user)
+        return Draft(markdown=TOO_LONG)                 # the writer never gets under the limit of 200 words
+
+    agents.LLM = llm
+    orchestrator.plan(project, "discussion")
+    orchestrator.approve(project, "discussion")
+    said = []
+    assert orchestrator.run_section(project, "discussion", said.append) == "ESCALATED"
+    assert "build/report.md" in said[-1]
+
+    again = prompts[1]                                  # round 2: the writer is told how much to cut and where
+    assert "Too long:" in again and "| cut " in again and "aim per heading: Principal findings" in again
+    assert "say each claim once: C1 take more than one paragraph" in again
+
+    (tmp_path / "inputs" / "discussion_draft.md").write_text(
+        "<!-- how to use -->\n\n## Principal findings\n\n" + " ".join(["kept"] * 250) + " [KEEP]\n", encoding="utf-8")
+    text = build.report(tmp_path, project.spec, project.status(), []).read_text(encoding="utf-8")
+    assert "## Where to shorten: discussion" in text and "The latest draft (drafts/discussion.r3.md) has" in text
+    assert "| Heading | Now | Target | Cut |" in text and "| Principal findings | " in text and "| Interpretation | " in text
+    assert "The longest paragraphs:" in text and "- C1: 2 paragraphs, " in text
+    assert "The claim table has 3 claims. At 200 words that is about 66 words per claim, less than one short" in text
+    assert "marks about 250 words as [KEEP]" in text and "that alone is over the limit" in text
+    assert "Your starting draft in inputs/discussion_draft.md has 252 words" in text
+    assert 'Filler to delete: "in order to" (1).' in text
+
+    (tmp_path / "drafts" / "discussion.md").write_text(GOOD, encoding="utf-8")      # a finished draft within the limit
+    text = build.report(tmp_path, project.spec, {"discussion": "DONE"}, []).read_text(encoding="utf-8")
+    assert "Where to shorten" not in text
+
+
 def test_escalates_when_rounds_run_out(project):
     agents.LLM = fake_llm([BAD, BAD, BAD], [])
     orchestrator.plan(project, "discussion")

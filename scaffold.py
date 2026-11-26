@@ -122,6 +122,26 @@ so it can be used in a hook or in CI. `paperkit status` shows the section status
 - Citations only as `[@key]`, and the key must be in `refs/library.bib` and in the claim table.
 - Wording matches the claim category: OBSERVED, INFERRED, ASSUMED, SPECULATIVE.
 
+## Evidence search
+
+After a section is planned, `paperkit evidence` looks for published studies that support or contradict
+its claims, and for other ways to read each finding. It searches Semantic Scholar (put a free key in `.env`
+as `SEMANTIC_SCHOLAR_API_KEY`; without one, searches are often refused).
+
+```bash
+paperkit evidence search discussion    # searches and screens -> build/evidence_discussion.md (calls the model)
+paperkit evidence review discussion    # asks about each suggestion: accept, reject or later
+paperkit evidence apply discussion     # carries accepted suggestions into the claim table
+```
+
+The model proposes, code checks, you decide. Every paper is a real record from the search service. A label
+(supports, contradicts, mixed) is kept only if the sentence it rests on is really in the abstract. The labels
+come from abstracts only, so read a paper before you accept it. Accepted papers that are not in
+`refs/library.bib` are written to `refs/suggested.bib`: import that file into Zotero and run `apply` again
+(or use `--add-to-library` if Zotero does not write `library.bib`). Each accepted paper gets a page in `wiki/`,
+and accepted papers and interpretations become new claims in the claim table. The table then loses its
+approval: read it, correct the wording, and approve it before the next run.
+
 ## Writing rules from guides
 
 Put the journal's guide for authors, reporting guidelines and style guides in `.writing_guides/journal`,
@@ -414,6 +434,7 @@ class Claim(BaseModel):
     fact_ids: list[str] = Field(default_factory=list, description="Ids from the facts registry")
     cite_keys: list[str] = Field(default_factory=list, description="Citation keys from the library")
     assumptions: list[str] = Field(default_factory=list, description="What this claim depends on")
+    origin: str = Field(default="", description="Leave empty. Code fills it in for claims that the evidence search added.")
 
 
 class ClaimList(BaseModel):
@@ -611,7 +632,7 @@ class Ping(BaseModel):
 def ping_all() -> list[tuple[str, str, str, str]]:
     """One tiny request per distinct provider and model in use: (agents, provider, model, 'ok' or the error)."""
     routes: dict[tuple[str, str], list[str]] = {}
-    for kind in (*PIPELINE_AGENTS, "facts", "rules"):    # the models behind `extract facts` and `rules extract`
+    for kind in (*PIPELINE_AGENTS, "facts", "rules", "literature"):    # also the models behind extract, rules, evidence
         routes.setdefault(route(kind), []).append(kind)
     rows = []
     for (provider, model), kinds in routes.items():
@@ -1628,6 +1649,7 @@ def plan(p: Project, sec_id: str, say=_quiet) -> tuple[ClaimTable, list[Issue]]:
             methods=p.inp("methods"), results=p.inp("results"), introduction=p.inp("introduction"), fact_reg=p.facts,
             starting_draft=p.draft(sec_id),
             library=zotero.library_listing(p.bib), wiki_index=wiki.index(p.root / "wiki"), issues=issues)
+        claims = [c.model_copy(update={"origin": ""}) for c in claims]     # only code marks where a claim came from
         table = ClaimTable(section_id=sec_id, approved=False, claims=claims)
         issues = blocking(check_claims(table, p.facts, set(p.bib)))
         say(f"  planner  done in {time.monotonic() - started:.0f} s: {len(claims)} claims")
@@ -1742,6 +1764,815 @@ def validate(p: Project, sec_id: str, path: Path | None = None) -> list[Issue]:
 # ----------------------------------------------------------------------------
 # src/paperkit/__main__.py
 # ----------------------------------------------------------------------------
+FILES['src/paperkit/scholar.py'] = r'''
+"""Semantic Scholar search. Standard library only, so there is no extra dependency.
+
+Every record here came from the API: the model never names a paper. Requests are paced, a refused
+request is tried again after a wait, and each answered search is saved in .cache/scholar/.
+
+A key is optional but matters: without one, searches share a pool with every other anonymous user and
+are often turned away. A free key (semanticscholar.org/product/api) allows one request per second.
+Put it in .env as SEMANTIC_SCHOLAR_API_KEY.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+BASE_URL = "https://api.semanticscholar.org/graph/v1"      # SEMANTIC_SCHOLAR_BASE_URL overrides it
+FIELDS = "title,abstract,year,authors,venue,externalIds,citationCount,url"
+PAUSE = 1.1                     # seconds between requests: a key allows one request per second
+BACKOFF = (3, 8, 20, 40)        # waits after HTTP 429 or 5xx: the API sends no Retry-After
+TIMEOUT = 30
+KEY_HINT = ("Without a key, Semantic Scholar often turns searches away. Request a free key at "
+            "semanticscholar.org/product/api and put SEMANTIC_SCHOLAR_API_KEY=... in .env.")
+STOPWORDS = {"the", "and", "for", "with", "from", "into", "that", "this", "does", "are", "was", "were", "between",
+             "among", "study", "analysis", "effect", "effects", "using", "based", "toward", "towards", "about"}
+_last = 0.0                     # when the last request was sent
+
+
+class SearchError(RuntimeError):
+    """The search service could not be used. The message says what to do."""
+
+
+def has_key() -> bool:
+    return bool((os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or "").strip())
+
+
+def _get(url: str) -> dict:
+    """One paced GET. HTTP 429 and 5xx are both the service saying "not now": wait and try again."""
+    global _last
+    key = (os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or "").strip()
+    headers = {"Accept": "application/json", "User-Agent": "paperkit (literature search for a manuscript)"}
+    if key:
+        headers["x-api-key"] = key
+    for wait in (*BACKOFF, None):
+        gap = PAUSE - (time.monotonic() - _last)
+        if gap > 0:
+            time.sleep(gap)
+        _last = time.monotonic()
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=TIMEOUT) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = " ".join(exc.read().decode("utf-8", "replace").split())[:200]
+            busy = exc.code == 429 or exc.code >= 500
+            if busy and wait is not None:
+                time.sleep(wait)
+                continue
+            if exc.code in (401, 403):
+                raise SearchError("Semantic Scholar rejected the key: check SEMANTIC_SCHOLAR_API_KEY in .env") from None
+            if busy:
+                raise SearchError(f"Semantic Scholar is not answering (HTTP {exc.code}, {len(BACKOFF) + 1} tries). "
+                                  + ("Try again later." if key else KEY_HINT)) from None
+            raise SearchError(f"Semantic Scholar: HTTP {exc.code}: {detail}") from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as exc:
+            if wait is not None:
+                time.sleep(min(wait, 5))
+                continue
+            reason = getattr(exc, "reason", exc)
+            raise SearchError(f"cannot reach Semantic Scholar: {' '.join(str(reason).split())[:160]}") from None
+    raise SearchError("no answer from Semantic Scholar")       # not reached
+
+
+def paper(raw: dict) -> dict | None:
+    """One API record in paperkit's shape, or None when it has no id or no title."""
+    if not isinstance(raw, dict):
+        return None
+    title = " ".join(str(raw.get("title") or "").split())
+    if not raw.get("paperId") or not title:
+        return None
+    ids = raw.get("externalIds") or {}
+    doi = next((str(value).strip().lower() for name, value in ids.items() if str(name).lower() == "doi" and value), "")
+    year = raw.get("year")
+    return {
+        "paper_id": str(raw["paperId"]), "title": title,
+        "authors": [str(a["name"]).strip() for a in raw.get("authors") or [] if isinstance(a, dict) and a.get("name")],
+        "year": year if isinstance(year, int) else None,
+        "venue": " ".join(str(raw.get("venue") or "").split()),
+        "doi": doi, "url": f"https://doi.org/{doi}" if doi else str(raw.get("url") or ""),
+        "abstract": " ".join(str(raw.get("abstract") or "").split()),      # often missing, even for well-known papers
+        "citations": int(raw.get("citationCount") or 0),
+    }
+
+
+def clean_query(query: str, words: int = 12) -> str:
+    """A query the relevance search accepts: no quotes or operators, and no hyphens (they match nothing there)."""
+    text = re.sub(r"[\"'“”‘’()\[\]{}:;,+|*~<>]", " ", unicodedata.normalize("NFKC", query)).replace("-", " ")
+    return " ".join(text.split()[:words])
+
+
+def search(query: str, limit: int = 5, cache_dir: Path | None = None, fresh: bool = False) -> list[dict]:
+    """The papers the relevance search returns for a query, best match first."""
+    query = clean_query(query)
+    if not query:
+        return []
+    base = (os.environ.get("SEMANTIC_SCHOLAR_BASE_URL") or BASE_URL).rstrip("/")
+    name = hashlib.sha256(json.dumps([query, limit, FIELDS]).encode("utf-8")).hexdigest()[:24]
+    cache = Path(cache_dir) / f"{name}.json" if cache_dir else None
+    if cache and cache.is_file() and not fresh:
+        try:
+            return json.loads(cache.read_text(encoding="utf-8"))
+        except ValueError:
+            pass
+    data = _get(f"{base}/paper/search?" + urllib.parse.urlencode({"query": query, "limit": limit, "fields": FIELDS}))
+    rows = data.get("data") if isinstance(data, dict) else None
+    papers = [found for found in map(paper, rows or []) if found]
+    if cache:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(papers, ensure_ascii=False), encoding="utf-8")
+    return papers
+
+
+# ------------------------------------------------------------------ references
+
+def _ascii(text: str) -> str:
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
+def cite_key(found: dict, taken) -> str:
+    """A citation key such as smith2020sleep that is not in `taken`."""
+    family = re.sub(r"[^a-z]", "", _ascii((found.get("authors") or ["anon"])[0].split()[-1]).lower()) or "anon"
+    title = re.sub(r"[^\w\s]", " ", found.get("title", ""))           # a dash or a brace separates words
+    word = next((w for w in re.findall(r"[a-z]+", _ascii(title).lower()) if len(w) > 3 and w not in STOPWORDS), "")
+    base = f"{family}{found.get('year') or 'nd'}{word}"
+    taken = set(taken)
+    key, n = base, 0
+    while key in taken:
+        n += 1
+        key = f"{base}{chr(96 + n)}" if n <= 26 else f"{base}{n}"
+    return key
+
+
+def bibtex(found: dict, key: str) -> str:
+    """A BibTeX entry built from the API record."""
+    def value(text: object) -> str:
+        return re.sub(r"[{}]", "", " ".join(str(text).split()))
+
+    fields = [("title", found.get("title", "")), ("author", " and ".join(found.get("authors") or [])),
+              ("year", found.get("year") or ""), ("journal", found.get("venue", "")),
+              ("doi", found.get("doi", "")), ("url", found.get("url", ""))]
+    rows = [f"  {name} = {{{value(text)}}}," for name, text in fields if str(text).strip()]
+    return "@article{" + key + ",\n" + "\n".join(rows) + "\n}\n"
+
+
+def norm_doi(text: str) -> str:
+    return re.sub(r"^(https?://)?(dx\.)?doi\.org/", "", str(text or "").strip().lower())
+
+
+def title_key(text: str) -> str:
+    return "".join(ch for ch in unicodedata.normalize("NFKC", str(text or "")).casefold() if ch.isalnum())
+
+
+def library_key(bib: dict, found: dict) -> str:
+    """The key under which a paper is already in refs/library.bib: matched by DOI, else by title. '' if it is not."""
+    doi, title = norm_doi(found.get("doi", "")), title_key(found.get("title", ""))
+    for key, fields in bib.items():
+        if doi and norm_doi(fields.get("doi", "")) == doi:
+            return key
+    for key, fields in bib.items():
+        if title and title_key(fields.get("title", "")) == title:
+            return key
+    return ""
+'''
+
+FILES['src/paperkit/evidence.py'] = r'''
+"""Evidence search: what published studies say about the claims of a section, and how else a finding could be read.
+
+The model proposes; code verifies; a person decides.
+- A `literature` agent writes three searches for each claim: for support, for contradiction, for other explanations.
+- Code runs them on Semantic Scholar, so every paper is a real record. The model never names a paper.
+- The agent labels each paper from its abstract (supports, contradicts, mixed, unrelated) and must quote the
+  sentence it relies on. Code keeps a label only if that quote is in the abstract.
+- The agent also lists other interpretations of the finding that the study design cannot rule out.
+- Nothing enters the paper by itself. You read the papers and accept or reject each suggestion. Accepted ones
+  become claims in the claim table, which loses its approval, so you read and approve it again as usual.
+
+Files: state/evidence/<section>.json (everything, with your decisions), build/evidence_<section>.md (to read),
+refs/suggested.bib (accepted papers that are not in refs/library.bib yet), wiki/<key>.md (one page per accepted paper).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import time
+import unicodedata
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+from . import agents, orchestrator, scholar, zotero
+from .schemas import Claim
+
+KINDS = ("supporting", "contradicting", "alternative")
+STANCES = ("supports", "contradicts", "mixed", "unclear", "not screened")
+HEADINGS = {"supports": "Supports", "contradicts": "Contradicts", "mixed": "Mixed", "unclear": "Unclear from the abstract",
+            "not screened": "Not screened: no abstract available"}
+GROUPS = {"supports": "supports", "contradicts": "contradicts"}       # every other stance goes to "other"
+LEADS = {"supports": "Earlier work agrees with our finding", "contradicts": "Earlier work disagrees with our finding",
+         "other": "Earlier work bears on our finding"}
+ORIGIN = "evidence search"
+MIN_QUOTE_WORDS = 4
+
+QUERIES = """You write literature searches for the claims of one section of a scientific paper.
+
+For each claim in <claims> return three keyword searches for a scholarly search engine. Each is 3 to 8 words, with no quotation marks, no hyphens and no operators such as AND or OR:
+- supporting: finds studies that report the same result
+- contradicting: finds studies that report the opposite result or no such result, for example with the words null, no association, or failed to replicate
+- alternative: finds studies on other explanations of such a result, for example confounding, reverse causation, selection or measurement
+
+Use the terms of the field as they appear in <methods>. Name the variables and the population, not our study. Return one entry for every claim id."""
+
+ASSESS = """You judge how published studies bear on ONE finding of a paper, from their abstracts only, and you list other ways that finding could be explained. You write no text for the paper.
+
+Part 1, verdicts. For every paper in <papers> return:
+- paper: its number
+- stance: "supports" if it reports the same direction of result in a comparable setting; "contradicts" if it reports the opposite result or finds no such result; "mixed" if both, or only in some groups or conditions; "unrelated" if the abstract reports no result on this question
+- quote: the one sentence of the abstract your verdict rests on, copied character for character. Empty for "unrelated".
+- note: one sentence, with no digits, saying what that study found in relation to our finding, worded as it could be said in a Discussion. Empty for "unrelated".
+Judge only from the abstract that is given. Do not use what you remember about a paper.
+
+Part 2, alternatives. List up to four other interpretations of OUR finding that the design in <methods> cannot rule out: confounding, reverse direction, selection, measurement, chance, or another kind. For each:
+- interpretation: one complete, hedged sentence with no digits, for example "The association may reflect ... rather than ..."
+- kind: confounding, reverse direction, selection, measurement, chance or other
+- papers: the numbers of the papers above that bear on it; may be empty
+- check: one sentence on which analysis or data would tell it apart from our reading
+Do not repeat what <limitations> already states. If there is no serious alternative, return an empty list."""
+
+
+class Searches(BaseModel):
+    claim_id: str = Field(description="The id of the claim, such as C2")
+    supporting: str
+    contradicting: str
+    alternative: str
+
+
+class SearchList(BaseModel):
+    searches: list[Searches] = Field(default_factory=list)
+
+
+class Verdict(BaseModel):
+    paper: int = Field(description="The number of the paper in <papers>")
+    stance: str = Field(description="supports, contradicts, mixed or unrelated")
+    quote: str = Field(default="", description="One sentence of the abstract, copied character for character")
+    note: str = Field(default="", description="One sentence with no digits")
+
+
+class Alternative(BaseModel):
+    interpretation: str = Field(description="One complete, hedged sentence with no digits")
+    kind: str = Field(default="other", description="confounding, reverse direction, selection, measurement, chance or other")
+    papers: list[int] = Field(default_factory=list, description="Numbers of papers in <papers> that bear on it")
+    check: str = Field(default="", description="Which analysis or data would tell it apart")
+
+
+class Assessment(BaseModel):
+    verdicts: list[Verdict] = Field(default_factory=list)
+    alternatives: list[Alternative] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------------ small helpers
+
+def _key(text: str) -> str:
+    """Letters and digits only, in lower case: what a quote is compared on."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", str(text or "")).casefold() if ch.isalnum())
+
+
+def _line(text: object, limit: int = 0) -> str:
+    text = " ".join(str(text or "").split())
+    return text if not limit or len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _file(root: Path, sec_id: str) -> Path:
+    return Path(root) / "state" / "evidence" / f"{sec_id}.json"
+
+
+def load(root: str | Path, sec_id: str) -> dict:
+    path = _file(Path(root), sec_id)
+    if not path.is_file():
+        return {"section": sec_id, "findings": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"state/evidence/{sec_id}.json is not valid JSON: {_line(exc, 120)}") from None
+    data.setdefault("findings", [])
+    return data
+
+
+def save(root: str | Path, sec_id: str, data: dict) -> None:
+    orchestrator._dump(_file(Path(root), sec_id), data)
+    write_report(Path(root), sec_id, data)
+
+
+def _cached(root: Path, kind: str, system: str, user: str, schema: type[BaseModel], fresh: bool) -> BaseModel:
+    """One model call, answered from .cache/evidence/ when the same question was asked before."""
+    name = hashlib.sha256(json.dumps([schema.__name__, system, user]).encode("utf-8")).hexdigest()[:24]
+    cache = root / ".cache" / "evidence" / f"{name}.json"
+    if cache.is_file() and not fresh:
+        try:
+            return schema.model_validate_json(cache.read_text(encoding="utf-8"))
+        except ValueError:
+            pass
+    answer = agents._ask(kind, system, user, schema)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(answer.model_dump_json(), encoding="utf-8")
+    return answer
+
+
+def targets(table) -> list[Claim]:
+    """The claims that are searched: what the paper reports and what it concludes. Not the ones this step added."""
+    return [c for c in table.claims if c.category in ("OBSERVED", "INFERRED") and c.origin != ORIGIN]
+
+
+def _cite(found: dict) -> str:
+    names = found.get("authors") or []
+    who = ", ".join(names[:3]) + (" et al." if len(names) > 3 else "") or "Unknown authors"
+    venue = f" {found['venue']}." if found.get("venue") else ""
+    return f"{who} ({found.get('year') or 'n.d.'}). {found.get('title', '')}.{venue}"
+
+
+# ------------------------------------------------------------------ search and screening
+
+def _searches(root: Path, p, claims: list[Claim], fresh: bool) -> dict[str, dict[str, str]]:
+    user = "\n\n".join([
+        agents._tag("claims", json.dumps([{"id": c.id, "text": c.text} for c in claims], ensure_ascii=False, indent=1)),
+        agents._tag("study_design", p.spec.design),
+        agents._tag("methods", " ".join(p.inp("methods").split()[:800])),
+    ])
+    got = _cached(root, "literature", QUERIES, user, SearchList, fresh)
+    out = {}
+    for row in got.searches:
+        out[row.claim_id.strip().upper()] = {kind: scholar.clean_query(getattr(row, kind)) for kind in KINDS}
+    for claim in claims:                       # a claim the model skipped is searched with its own words
+        have = out.setdefault(claim.id, {})
+        have["supporting"] = have.get("supporting") or scholar.clean_query(claim.text)
+        have["contradicting"] = have.get("contradicting") or scholar.clean_query(claim.text + " null no association", 16)
+        have["alternative"] = have.get("alternative") or scholar.clean_query(claim.text + " confounding", 14)
+    return out
+
+
+def _assess(root: Path, p, claim: Claim, screened: list[dict], fresh: bool) -> Assessment:
+    listing = "\n\n".join(f"[{n}] {found['title']} ({found.get('year') or 'n.d.'})\n{found['abstract']}"
+                          for n, found in enumerate(screened, 1))
+    user = "\n\n".join([
+        agents._tag("finding", claim.text),
+        agents._tag("study_design", p.spec.design),
+        agents._tag("methods", " ".join(p.inp("methods").split()[:800])),
+        agents._tag("limitations", p.inp("limitations")),
+        agents._tag("papers", listing or "(no paper with an abstract was found)"),
+    ])
+    return _cached(root, "literature", ASSESS, user, Assessment, fresh)
+
+
+def _verdicts(answer: Assessment, screened: list[dict]) -> dict[int, dict]:
+    """Stance, quote and note for each screened paper, by position. A label whose quote is not in the abstract is not kept."""
+    out: dict[int, dict] = {}
+    for verdict in answer.verdicts:
+        position = verdict.paper - 1
+        if not 0 <= position < len(screened) or position in out:
+            continue
+        stance = verdict.stance.strip().lower()
+        if stance == "unrelated":
+            out[position] = {"stance": "unrelated", "quote": "", "note": ""}
+            continue
+        quote = _line(unicodedata.normalize("NFKC", verdict.quote))
+        in_abstract = len(quote.split()) >= MIN_QUOTE_WORDS and _key(quote) in _key(screened[position]["abstract"])
+        if stance not in ("supports", "contradicts", "mixed") or not in_abstract:
+            out[position] = {"stance": "unclear", "quote": quote if in_abstract else "", "note": _line(verdict.note)}
+        else:
+            out[position] = {"stance": stance, "quote": quote, "note": _line(verdict.note)}
+    return out
+
+
+def search(root: str | Path, sec_id: str, fresh: bool = False, say=lambda text: None) -> dict:
+    """Searches the literature for every reported and inferred claim of the section. Your earlier decisions are kept."""
+    root = Path(root)
+    p = orchestrator.Project(root)
+    p.spec.section(sec_id)
+    table = p.load_claims(sec_id)
+    if table is None:
+        raise ValueError(f"No claim table for '{sec_id}'. Plan the section first (menu 3, or: paperkit plan {sec_id}).")
+    claims = targets(table)
+    if not claims:
+        raise ValueError(f"The claim table for '{sec_id}' has no OBSERVED or INFERRED claim to search for.")
+    old = load(root, sec_id)
+    before = {f.get("claim_id"): f for f in old["findings"]}
+    limit = int(os.environ.get("PAPERKIT_SEARCH_RESULTS") or "5")
+    cache_dir = root / ".cache" / "scholar"
+    failed: list[str] = []
+
+    say(f"evidence: writing searches for {len(claims)} claim(s) ...")
+    searches = _searches(root, p, claims, fresh)
+    number = {"E": 0, "A": 0}
+    for finding in old["findings"]:
+        for prefix, rows in (("E", finding.get("papers", [])), ("A", finding.get("alternatives", []))):
+            for row in rows:
+                found = re.fullmatch(rf"{prefix}(\d+)", str(row.get("id", "")))
+                number[prefix] = max(number[prefix], int(found.group(1)) if found else 0)
+
+    findings, search_down = [], False
+    for position, claim in enumerate(claims, 1):
+        earlier = before.get(claim.id, {})
+        if search_down:                        # the search service stopped answering: keep what there was
+            if earlier:
+                findings.append(earlier)
+            continue
+        where = f"evidence: {claim.id} ({position} of {len(claims)})"
+        queries = searches[claim.id]
+        papers: dict[str, dict] = {}
+        try:
+            for kind in KINDS:
+                if kind != "supporting" and queries[kind] in [queries[k] for k in KINDS[:KINDS.index(kind)]]:
+                    continue
+                for found in scholar.search(queries[kind], limit, cache_dir, fresh):
+                    papers.setdefault(found["paper_id"], {**found, "found_by": []})["found_by"].append(kind)
+        except scholar.SearchError as exc:
+            failed.append(f"{claim.id}: {_line(exc, 300)}")
+            search_down = True
+            if earlier:
+                findings.append(earlier)
+            continue
+        screened = [found for found in papers.values() if found["abstract"]]
+        say(f"{where}: {len(papers)} paper(s) found, {len(screened)} with an abstract; asking the model ...")
+        try:
+            answer = _assess(root, p, claim, screened, fresh)
+        except Exception as exc:               # a provider error: keep going, this claim is asked again next time
+            failed.append(f"{claim.id}: {type(exc).__name__}: {_line(exc, 200)}")
+            if earlier:
+                findings.append(earlier)
+            continue
+
+        verdicts = _verdicts(answer, screened)
+        decided = {row.get("paper_id"): row for row in earlier.get("papers", [])}
+        rows, unrelated = [], 0
+        for found in papers.values():
+            verdict = (verdicts.get(screened.index(found), {"stance": "unclear", "quote": "", "note": ""})
+                       if found["abstract"] else {"stance": "not screened", "quote": "", "note": ""})
+            if verdict["stance"] == "unrelated":
+                unrelated += 1
+                continue
+            kept = decided.get(found["paper_id"], {})
+            rows.append({"id": kept.get("id", ""), **found, **verdict, "decision": kept.get("decision", ""),
+                         "in_library": scholar.library_key(p.bib, found)})
+        rows.sort(key=lambda row: (STANCES.index(row["stance"]), -row["citations"]))
+        for row in rows:                       # numbered in the order they are shown; a paper seen before keeps its number
+            if not row["id"]:
+                number["E"] += 1
+                row["id"] = f"E{number['E']}"
+
+        known = {_key(row.get("interpretation")): row for row in earlier.get("alternatives", [])}
+        others = []
+        for alternative in answer.alternatives[:4]:
+            text = _line(alternative.interpretation)
+            if not text or _key(text) in [_key(row["interpretation"]) for row in others]:
+                continue
+            kept = known.get(_key(text), {})
+            if not kept.get("id"):
+                number["A"] += 1
+            bearing = [screened[n - 1]["paper_id"] for n in alternative.papers if 0 < n <= len(screened)]
+            others.append({"id": kept.get("id") or f"A{number['A']}", "interpretation": text,
+                           "kind": _line(alternative.kind).lower() or "other", "check": _line(alternative.check),
+                           "papers": [row["id"] for row in rows if row["paper_id"] in bearing],
+                           "decision": kept.get("decision", ""), "claim": kept.get("claim", "")})
+        findings.append({"claim_id": claim.id, "text": claim.text, "searches": queries, "papers": rows,
+                         "alternatives": others, "unrelated": unrelated, "claims": earlier.get("claims", {})})
+
+    data = {"section": sec_id, "searched": time.strftime("%Y-%m-%d"), "source": "Semantic Scholar", "findings": findings}
+    save(root, sec_id, data)
+    return {"data": data, "failed": failed}
+
+
+# ------------------------------------------------------------------ the readable report
+
+def _mark(row: dict) -> str:
+    return {"accepted": "x", "rejected": "-"}.get(row.get("decision", ""), " ")
+
+
+def write_report(root: Path, sec_id: str, data: dict) -> Path:
+    lines = [f"# Evidence search: {sec_id}", "",
+             f"Searched {data.get('source', 'Semantic Scholar')} on {data.get('searched', 'an earlier day')}. "
+             "The labels come from abstracts only: read a paper before you accept it.",
+             "[x] accepted, [-] rejected, [ ] not decided. Decide with: paperkit evidence review " + sec_id, ""]
+    for finding in data.get("findings", []):
+        lines += [f"## {finding['claim_id']}: {finding['text']}", "",
+                  "Searches: " + "; ".join(f"{finding['searches'].get(kind, '')} ({kind})" for kind in KINDS), ""]
+        if not finding["papers"]:
+            lines += ["No related paper was found. That is not the same as there being none.", ""]
+        for stance in STANCES:
+            rows = [row for row in finding["papers"] if row["stance"] == stance]
+            if not rows:
+                continue
+            lines += [f"### {HEADINGS[stance]} ({len(rows)})", ""]
+            for row in rows:
+                lines.append(f"- [{_mark(row)}] {row['id']}  {_cite(row)} Cited {row['citations']} times. {row['url']}"
+                             + (f"  In your library as [@{row['in_library']}]." if row.get("in_library") else ""))
+                if row["quote"]:
+                    lines.append(f"  > \"{row['quote']}\"")
+                if row["note"]:
+                    lines.append(f"  {row['note']}")
+            lines.append("")
+        if finding.get("unrelated"):
+            lines += [f"{finding['unrelated']} more paper(s) were found and judged unrelated.", ""]
+        if finding["alternatives"]:
+            lines += ["### Other interpretations", ""]
+            for row in finding["alternatives"]:
+                lines.append(f"- [{_mark(row)}] {row['id']}  ({row['kind']}) {row['interpretation']}"
+                             + (f" Papers: {', '.join(row['papers'])}." if row["papers"] else ""))
+                if row["check"]:
+                    lines.append(f"  To tell them apart: {row['check']}")
+            lines.append("")
+    out = root / "build" / f"evidence_{sec_id}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    return out
+
+
+def counts(data: dict) -> dict:
+    papers = [row for f in data.get("findings", []) for row in f["papers"]]
+    others = [row for f in data.get("findings", []) for row in f["alternatives"]]
+    return {"papers": len(papers), "accepted": sum(row["decision"] == "accepted" for row in papers),
+            "open": sum(not row["decision"] for row in papers + others),
+            "alternatives": len(others), "alternatives_accepted": sum(row["decision"] == "accepted" for row in others)}
+
+
+# ------------------------------------------------------------------ your decisions
+
+def show(finding: dict, row: dict) -> list[str]:
+    if "interpretation" in row:
+        rows = [f"{row['id']}  other interpretation ({row['kind']}): {row['interpretation']}"]
+        if row["papers"]:
+            rows.append(f"      Papers that bear on it: {', '.join(row['papers'])}")
+        if row["check"]:
+            rows.append(f"      To tell them apart: {row['check']}")
+        return rows
+    rows = [f"{row['id']}  {row['stance']}: {_cite(row)} Cited {row['citations']} times.", f"      {row['url']}"]
+    if row["quote"]:
+        rows.append(f"      \"{row['quote']}\"")
+    if row["note"]:
+        rows.append(f"      {row['note']}")
+    if row.get("in_library"):
+        rows.append(f"      Already in your library as [@{row['in_library']}].")
+    return rows
+
+
+def review(root: str | Path, sec_id: str, ask=input, out=print) -> int:
+    """Walks through every suggestion that has no decision yet. Returns how many were accepted."""
+    root = Path(root)
+    data = load(root, sec_id)
+    accepted = 0
+    waiting = [(f, row) for f in data["findings"] for row in f["papers"] + f["alternatives"] if not row.get("decision")]
+    try:
+        for number, (finding, row) in enumerate(waiting, 1):
+            out("")
+            out(f"{number} of {len(waiting)}, for {finding['claim_id']}: {_line(finding['text'], 110)}")
+            for text in show(finding, row):
+                out(text)
+            answer = ask("[y] accept  [n] reject  [l] later  [q] stop > ").strip().lower()[:1]
+            if answer == "q":
+                break
+            if answer == "y":
+                row["decision"] = "accepted"
+                accepted += 1
+            elif answer == "n":
+                row["decision"] = "rejected"
+    except EOFError:
+        pass
+    finally:
+        save(root, sec_id, data)               # whatever was decided so far is kept
+    return accepted
+
+
+def decide(root: str | Path, sec_id: str, ids, decision: str) -> int:
+    data = load(Path(root), sec_id)
+    wanted = {str(i).upper() for i in ids}
+    rows = [row for f in data["findings"] for row in f["papers"] + f["alternatives"] if row["id"].upper() in wanted]
+    unknown = sorted(wanted - {row["id"].upper() for row in rows})
+    if unknown:
+        raise ValueError(f"No such suggestion: {', '.join(unknown)}. `paperkit evidence list {sec_id}` shows the ids.")
+    for row in rows:
+        row["decision"] = decision
+    save(Path(root), sec_id, data)
+    return len(rows)
+
+
+# ------------------------------------------------------------------ accepted suggestions -> library, wiki, claim table
+
+def _wiki_page(key: str, found: dict, uses: list[tuple[dict, dict]], sec_id: str) -> str:
+    lines = [f"# {key}", "", f"{_cite(found)} {found['url']}", "",
+             f"Added by the evidence search for the {sec_id} section. Everything below is from the abstract only:",
+             "add what you find in the full text and correct what is wrong.", "",
+             "## Question", "", "## Design and sample", "", "## Key findings", ""]
+    lines += [f"- {row['note'] or 'See the abstract.'} ({row['stance']}, in relation to: {_line(finding['text'], 100)})"
+              for finding, row in uses]
+    lines += ["", "## Quotes", ""]
+    lines += [f"> \"{quote}\" (abstract)" for quote in dict.fromkeys(row["quote"] for _, row in uses if row["quote"])]
+    lines += ["", "## Limitations", "", "## Abstract", "", found["abstract"] or "(no abstract available)"]
+    return "\n".join(lines) + "\n"
+
+
+def apply(root: str | Path, sec_id: str, add_to_library: bool = False) -> dict:
+    """Carries the accepted suggestions into the project. Safe to repeat: nothing is added twice.
+
+    A paper has to be in refs/library.bib before a claim can cite it. Papers that are not there yet are written
+    to refs/suggested.bib for you to import into Zotero. `add_to_library` appends them to refs/library.bib
+    instead: use it only if Zotero does not write that file.
+    """
+    root = Path(root)
+    data = load(root, sec_id)
+    p = orchestrator.Project(root)
+    table = p.load_claims(sec_id)
+    if table is None:
+        raise ValueError(f"No claim table for '{sec_id}'. Plan the section first (menu 3, or: paperkit plan {sec_id}).")
+    bib_path = root / "refs" / "library.bib"
+    bib = zotero.load_bib(bib_path)
+    accepted = {}                              # paper id -> record, each paper once
+    for finding in data["findings"]:
+        for row in finding["papers"]:
+            if row.get("decision") == "accepted":
+                accepted.setdefault(row["paper_id"], row)
+
+    missing = [row for row in accepted.values() if not scholar.library_key(bib, row)]
+    suggested = root / "refs" / "suggested.bib"
+    added_to_library: list[str] = []
+    if missing:
+        taken = set(bib)
+        entries = []
+        for row in missing:
+            key = scholar.cite_key(row, taken)
+            taken.add(key)
+            entries.append(scholar.bibtex(row, key))
+            added_to_library.append(key)
+        if add_to_library:
+            current = bib_path.read_text(encoding="utf-8") if bib_path.exists() else ""
+            bib_path.parent.mkdir(parents=True, exist_ok=True)
+            bib_path.write_text(current.rstrip("\n") + "\n\n% Added by `paperkit evidence apply`\n" + "\n".join(entries),
+                                encoding="utf-8")
+            bib, missing = zotero.load_bib(bib_path), []
+        else:
+            suggested.write_text("% Papers accepted in the evidence search that are not in refs/library.bib yet.\n"
+                                 "% Import this file into Zotero, then run: paperkit evidence apply " + sec_id + "\n\n"
+                                 + "\n".join(entries), encoding="utf-8")
+            added_to_library = []
+    if not missing and suggested.exists():
+        suggested.unlink()                     # everything in it has reached the library
+
+    keys = {paper_id: scholar.library_key(bib, row) for paper_id, row in accepted.items()}
+    for finding in data["findings"]:
+        for row in finding["papers"]:
+            row["in_library"] = scholar.library_key(bib, row)
+
+    pages = []
+    wiki_dir = root / "wiki"
+    for paper_id, row in accepted.items():
+        key = keys[paper_id]
+        if not key or (wiki_dir / f"{key}.md").exists():
+            continue
+        uses = [(f, r) for f in data["findings"] for r in f["papers"]
+                if r["paper_id"] == paper_id and r.get("decision") == "accepted"]
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        (wiki_dir / f"{key}.md").write_text(_wiki_page(key, row, uses, sec_id), encoding="utf-8")
+        index = wiki_dir / "index.md"
+        listed = index.read_text(encoding="utf-8") if index.exists() else "# Wiki index\n\n"
+        if f"[[{key}]]" not in listed:
+            index.write_text(listed.rstrip("\n") + f"\n- [[{key}]]: {_line(row['title'], 90)}\n", encoding="utf-8")
+        pages.append(key)
+
+    by_id = {c.id: c for c in table.claims}
+    last = max([int(c.id[1:]) for c in table.claims if re.fullmatch(r"C\d+", c.id)] or [0])
+    new, grown = [], []
+
+    def carry(holder: dict, slot: str, text: str, category: str, cite_keys: list[str]) -> None:
+        nonlocal last
+        claim_id = holder.get(slot, "")
+        if claim_id:                           # added before: only new sources are added, your wording stays
+            claim = by_id.get(claim_id)
+            fresh_keys = [k for k in cite_keys if claim and k not in claim.cite_keys]
+            if fresh_keys:
+                claim.cite_keys += fresh_keys
+                grown.append(claim_id)
+            return                             # a claim you deleted from the table is not added again
+        last += 1
+        claim = Claim(id=f"C{last}", text=text, category=category, cite_keys=cite_keys, origin=ORIGIN)
+        table.claims.append(claim)
+        by_id[claim.id] = claim
+        holder[slot] = claim.id
+        new.append(claim.id)
+
+    for finding in data["findings"]:
+        finding.setdefault("claims", {})
+        ours = _line(finding["text"]).rstrip(".")
+        for group in ("supports", "contradicts", "other"):
+            rows = [row for row in finding["papers"] if row.get("decision") == "accepted"
+                    and GROUPS.get(row["stance"], "other") == group and keys.get(row["paper_id"])]
+            if not rows:
+                continue
+            notes = list(dict.fromkeys(row["note"] for row in rows if row["note"] and not re.search(r"\d", row["note"])))
+            text = f"{LEADS[group]} ({ours})" + (": " + " ".join(notes) if notes else ".")
+            carry(finding["claims"], group, text, "INFERRED", list(dict.fromkeys(keys[row["paper_id"]] for row in rows)))
+        ids = {row["id"]: row for row in finding["papers"]}
+        for other in finding["alternatives"]:
+            if other.get("decision") != "accepted":
+                continue
+            cited = [keys.get(ids[i]["paper_id"], "") for i in other["papers"]
+                     if i in ids and ids[i].get("decision") == "accepted"]
+            carry(other, "claim", other["interpretation"], "SPECULATIVE", [k for k in dict.fromkeys(cited) if k])
+
+    if new or grown:
+        table.approved = False                 # the table changed: a person reads and approves it again
+        p.save_claims(table)
+        p.set_status(sec_id, "AWAITING_APPROVAL")
+    save(root, sec_id, data)
+    return {"new": new, "grown": grown, "pages": pages, "added_to_library": added_to_library,
+            "waiting": [_line(row["title"], 90) for row in missing]}
+
+
+def missing_from_library(root: str | Path, sec_id: str) -> int:
+    """How many accepted papers are not in refs/library.bib yet."""
+    root = Path(root)
+    bib = zotero.load_bib(root / "refs" / "library.bib")
+    rows = {row["paper_id"]: row for f in load(root, sec_id)["findings"] for row in f["papers"]
+            if row.get("decision") == "accepted"}
+    return sum(1 for row in rows.values() if not scholar.library_key(bib, row))
+
+
+# ------------------------------------------------------------------ `paperkit evidence`
+
+def _report_apply(done: dict, sec_id: str, out) -> None:
+    if done["added_to_library"]:
+        out(f"Added to refs/library.bib: {', '.join(done['added_to_library'])}")
+    if done["pages"]:
+        out(f"Wiki pages written (from the abstract: add what the full text says): {', '.join(done['pages'])}")
+    if done["new"]:
+        out(f"New claims in the claim table: {', '.join(done['new'])}")
+    if done["grown"]:
+        out(f"Sources added to claims: {', '.join(done['grown'])}")
+    if done["new"] or done["grown"]:
+        out(f"The claim table is no longer approved. Read it, correct the wording, then: paperkit approve {sec_id}")
+    if done["waiting"]:
+        out(f"{len(done['waiting'])} accepted paper(s) are not in refs/library.bib yet, so no claim cites them:")
+        for title in done["waiting"]:
+            out(f"  - {title}")
+        out(f"Import refs/suggested.bib into Zotero, then run: paperkit evidence apply {sec_id}")
+        out("If Zotero does not write refs/library.bib, add --add-to-library instead.")
+    if not any(done.values()):
+        out("Nothing to carry over: no accepted suggestion is waiting.")
+
+
+def run(root: str | Path, action: str, sec_id: str, ids=(), fresh: bool = False, add_to_library: bool = False,
+        out=print, ask=input) -> int:
+    """search | list | review | accept | reject | apply. Exit code 1 if something failed."""
+    root = Path(root)
+    try:
+        if action == "search":
+            got = search(root, sec_id, fresh, out)
+            found = counts(got["data"])
+            out(f"evidence: {found['papers']} paper(s) and {found['alternatives']} other interpretation(s) for "
+                f"{len(got['data']['findings'])} claim(s) -> build/evidence_{sec_id}.md")
+            for row in got["failed"]:
+                out(f"  failed: {row}")
+            if got["failed"]:
+                out("Run it again for what failed: answered searches and model calls are kept and are not repeated.")
+            if not scholar.has_key() and not got["failed"]:
+                out("Tip: " + scholar.KEY_HINT)
+            if found["open"]:
+                out(f"Nothing is used until you accept it: paperkit evidence review {sec_id}")
+            return 1 if got["failed"] else 0
+        data = load(root, sec_id)
+        if not data["findings"]:
+            out(f"No evidence search for '{sec_id}' yet. Run: paperkit evidence search {sec_id}")
+            return 0 if action == "list" else 1
+        if action == "list":
+            for finding in data["findings"]:
+                out(f"{finding['claim_id']}: {_line(finding['text'], 110)}")
+                for row in finding["papers"] + finding["alternatives"]:
+                    out(f"  [{_mark(row)}] " + show(finding, row)[0])
+            found = counts(data)
+            out(f"{found['accepted']} of {found['papers']} paper(s) and {found['alternatives_accepted']} of "
+                f"{found['alternatives']} interpretation(s) accepted. Details: build/evidence_{sec_id}.md")
+            return 0
+        if action in ("accept", "reject"):
+            if not ids:
+                out(f"Name the suggestions, for example: paperkit evidence {action} {sec_id} E2 A1")
+                return 1
+            out(f"{decide(root, sec_id, ids, action + 'ed')} suggestion(s) {action}ed.")
+        elif action == "review":
+            out(f"{review(root, sec_id, ask, out)} suggestion(s) accepted.")
+        _report_apply(apply(root, sec_id, add_to_library), sec_id, out)
+        return 0
+    except (ValueError, KeyError, RuntimeError, OSError) as exc:
+        out(f"evidence: {type(exc).__name__}: {_line(exc, 300)}")
+        return 1
+'''
+
 FILES['src/paperkit/__main__.py'] = r'''
 """CLI: python -m paperkit <command>, or paperkit <command> after pip install -e .
 
@@ -1754,7 +2585,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, wiki, wizard
+from . import agents, build, dryrun, env, evidence, extract, facts, orchestrator, preflight, wiki, wizard
 from .ingestion import rules_ingest
 from .schemas import Issue
 from .validators import blocking
@@ -1821,6 +2652,15 @@ def main(argv: list[str] | None = None) -> int:
     rul.add_argument("ids", nargs="*", help="rule ids such as R3 R7, for approve and reject")
     rul.add_argument("--all", action="store_true", help="approve every candidate")
     rul.add_argument("--fresh", action="store_true", help="ask the model again instead of using saved answers")
+    evi = sub.add_parser("evidence", help="search the literature for a section's claims: support, contradiction, "
+                                          "other interpretations")
+    evi.add_argument("action", choices=["search", "list", "review", "accept", "reject", "apply"],
+                     help="search calls the model and Semantic Scholar; review asks about each suggestion in turn")
+    evi.add_argument("section", nargs="?", help="may be left out when paper.yaml has one section")
+    evi.add_argument("ids", nargs="*", help="suggestion ids such as E2 A1, for accept and reject")
+    evi.add_argument("--fresh", action="store_true", help="search and ask again instead of using saved answers")
+    evi.add_argument("--add-to-library", action="store_true",
+                     help="append accepted papers to refs/library.bib (only if Zotero does not write that file)")
     plan = sub.add_parser("plan", help="build the claim table")
     plan.add_argument("section")
     plan.add_argument("--force", action="store_true", help="call the model even if required inputs are missing")
@@ -1842,7 +2682,8 @@ def main(argv: list[str] | None = None) -> int:
         for kind in agents.PIPELINE_AGENTS:
             agents.route(kind)
     except (ValueError, OSError) as exc:
-        if cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action == "extract"):
+        if (cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action == "extract")
+                or (cmd == "evidence" and args.action == "search")):
             print(f"Model configuration is not valid: {exc}")
             return 2
 
@@ -1871,6 +2712,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if dryrun.passed(result) else 1
 
     p = orchestrator.Project(root)
+    if cmd == "evidence":
+        names = [sec.id for sec in p.spec.sections]
+        section, ids = args.section, list(args.ids)
+        if section not in names and len(names) == 1:       # one section: its name may be left out
+            section, ids = names[0], ([section] if section else []) + ids
+        if section not in names:
+            print(f"Name the section: paperkit evidence {args.action} <section>, one of: {', '.join(names)}")
+            return 1
+        return evidence.run(root, args.action, section, ids, args.fresh, args.add_to_library, out=_say)
     if cmd == "status":
         status = p.status()
         for sec in p.spec.sections:
@@ -3133,7 +3983,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, zotero
+from . import agents, build, dryrun, env, evidence, extract, facts, orchestrator, preflight, zotero
 from .ingestion import rules_ingest
 from .schemas import ClaimTable, Issue
 from .validators import blocking
@@ -3160,6 +4010,7 @@ MENU = {
     "f": "Draft facts.csv from the Results section           (calls the API)",
     "k": "Draft key_messages.md from the Results section     (calls the API)",
     "r": "Writing rules from the guides in .writing_guides   (reading them calls the API)",
+    "e": "Search the literature for a section's claims       (calls the API and Semantic Scholar)",
     "q": "Quit",
 }
 
@@ -3497,7 +4348,8 @@ def show_claims(ui: UI, table: ClaimTable) -> None:
         ui.out(f"  {c.id:<4}{c.category:<12}{c.text}")
         extra = [f"facts: {', '.join(c.fact_ids)}" if c.fact_ids else "",
                  f"cites: {', '.join(c.cite_keys)}" if c.cite_keys else "",
-                 f"assumes: {'; '.join(c.assumptions)}" if c.assumptions else ""]
+                 f"assumes: {'; '.join(c.assumptions)}" if c.assumptions else "",
+                 "added by the evidence search" if c.origin else ""]
         if any(extra):
             ui.out("      " + "   ".join(e for e in extra if e))
 
@@ -3683,6 +4535,32 @@ def act_rules(ui: UI, root: Path) -> None:
         rules_ingest.run(root, "list", out=ui.out)
 
 
+def act_evidence(ui: UI, root: Path) -> None:
+    p = _project(ui, root)
+    if p is None:
+        return
+    sec_id = _section(ui, p)
+    found = evidence.counts(evidence.load(root, sec_id))
+    ui.out(f"{sec_id}: {found['papers']} suggested paper(s), {found['accepted']} accepted; {found['alternatives']} other "
+           f"interpretation(s), {found['alternatives_accepted']} accepted; {found['open']} not decided.")
+    choice = ui.choose("What now?", {
+        "x": "search the literature for this section's claims (calls the API and Semantic Scholar)",
+        "a": "go through the suggestions that have no decision yet",
+        "p": "carry the accepted suggestions into the claim table",
+        "l": "list all suggestions", "b": "back"}, default="b")
+    if choice == "x" and _confirm_api(ui, "literature"):
+        evidence.run(root, "search", sec_id, out=ui.out)
+    elif choice == "a":
+        evidence.run(root, "review", sec_id, out=ui.out, ask=ui.ask)
+    elif choice == "p":
+        add = evidence.missing_from_library(root, sec_id) > 0 and ui.confirm(
+            "Some accepted papers are not in refs/library.bib. Add them to that file now? "
+            "Say no if Zotero writes it: import refs/suggested.bib into Zotero instead.", False)
+        evidence.run(root, "apply", sec_id, add_to_library=add, out=ui.out)
+    elif choice == "l":
+        evidence.run(root, "list", sec_id, out=ui.out)
+
+
 def _draft_from_results(ui: UI, root: Path, what: str) -> None:
     """Menu f and k: the same drafting step that the input checklist offers, reachable at any time."""
     name = "inputs/facts.csv" if what == "facts" else "inputs/key_messages.md"
@@ -3702,7 +4580,7 @@ def act_key_messages(ui: UI, root: Path) -> None:
 
 ACTIONS = {"1": act_inputs, "2": act_dry_run, "3": act_plan, "4": act_approve,
            "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models,
-           "f": act_facts, "k": act_key_messages, "r": act_rules}
+           "f": act_facts, "k": act_key_messages, "r": act_rules, "e": act_evidence}
 
 
 def menu(ui: UI, root: Path) -> int:
@@ -4787,7 +5665,7 @@ def test_ping_reports_each_model(project, monkeypatch, capsys):
     monkeypatch.setattr(nvidia, "post", stand_in_endpoint([]))
     assert main(["--root", str(project), "ping"]) == 0
     out = capsys.readouterr().out
-    assert "(planner, writer, facts, rules): ok" in out and "other/model  (reviewer): ok" in out
+    assert "(planner, writer, facts, rules, literature): ok" in out and "other/model  (reviewer): ok" in out
 
     def refuse(url, key, body):
         raise nvidia.ApiError(401, "Unauthorized")
@@ -5333,6 +6211,360 @@ def test_checklist_and_menu_show_the_guides(project):
 '''
 
 
+# ----------------------------------------------------------------------------
+# tests/test_evidence.py
+# ----------------------------------------------------------------------------
+FILES['tests/test_evidence.py'] = r'''
+"""Evidence search: Semantic Scholar client, screening, your decisions, and what reaches the claim table.
+
+No network: the search service and the model are replaced.
+"""
+import json
+import re
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+
+from paperkit import agents, evidence, orchestrator, scholar, wizard, zotero
+from paperkit.__main__ import main
+from paperkit.evidence import Alternative, Assessment, SearchList, Searches, Verdict
+from paperkit.schemas import Claim, ClaimList, ClaimTable
+from paperkit.validators import blocking, check_claims
+
+SPEC = """title: Test paper
+design: observational
+max_rounds: 3
+sections:
+  - id: discussion
+    title: Discussion
+    max_words: 400
+    required_headings: [Principal findings, Interpretation]
+"""
+FACTS = {"F1": {"text": "r = 0.31", "source": "Table 2"}}
+BIB = ("@article{lee2019,\n  title = {A known paper on sleep},\n  author = {Lee, C.},\n  year = {2019},\n"
+       "  doi = {10.1000/KNOWN},\n}\n")
+CLAIMS = [
+    Claim(id="C1", text="Longer sleep was associated with better memory.", category="OBSERVED", fact_ids=["F1"]),
+    Claim(id="C2", text="Sleep may support memory consolidation in adolescents.", category="INFERRED"),
+    Claim(id="C3", text="Sleep diaries measured sleep without bias.", category="ASSUMED"),
+]
+
+
+def record(paper_id, title, abstract, doi="", year=2020, authors=("Ana Smith", "Bo Jones"), citations=10):
+    return {"paper_id": paper_id, "title": title, "authors": list(authors), "year": year, "venue": "Journal of Sleep",
+            "doi": doi, "url": f"https://doi.org/{doi}" if doi else f"https://example.org/{paper_id}",
+            "abstract": abstract, "citations": citations}
+
+
+SUPPORT = record("p1", "Sleep and memory in adolescents",
+                 "We studied 300 adolescents. Longer sleep was associated with better memory scores. Effects were stable.",
+                 "10.1000/sleep.1", citations=152)
+AGAINST = record("p2", "No link between sleep and memory in adults",
+                 "In 900 adults we found no association between sleep duration and memory performance.",
+                 "10.1000/sleep.2", year=2021, authors=("Dae Kim",))
+NO_ABSTRACT = record("p3", "Sleep and recall: a cohort study", "", "10.1000/sleep.3")
+OFF_TOPIC = record("p4", "Sleep in fruit flies", "Fruit flies sleep at night. We describe their rest in detail.")
+KNOWN = record("p5", "A known paper on sleep", "Sleep matters for many outcomes across the life span.", "10.1000/known",
+               year=2019, authors=("Chen Lee",))
+INTERPRETATION = "The association may reflect family income rather than sleep itself."
+
+
+@pytest.fixture
+def project(tmp_path, monkeypatch):
+    for name in ["PAPERKIT_PROVIDER", "PAPERKIT_MODEL", "ANTHROPIC_API_KEY", "PAPERKIT_ENV_FILE",
+                 "SEMANTIC_SCHOLAR_API_KEY", "SEMANTIC_SCHOLAR_BASE_URL", "PAPERKIT_SEARCH_RESULTS"]:
+        monkeypatch.setenv(name, "")
+    monkeypatch.setattr(scholar, "PAUSE", 0)
+    monkeypatch.setattr(scholar, "BACKOFF", (0, 0))
+    root = tmp_path / "repo" / "project"
+    for folder in ["facts", "refs", "inputs", "wiki", "state"]:
+        (root / folder).mkdir(parents=True)
+    (root / "paper.yaml").write_text(SPEC, encoding="utf-8")
+    (root / "facts" / "facts.json").write_text(json.dumps(FACTS), encoding="utf-8")
+    (root / "refs" / "library.bib").write_text(BIB, encoding="utf-8")
+    (root / "inputs" / "methods.md").write_text("# Methods\n\nA cross-sectional survey of adolescents.\n", encoding="utf-8")
+    (root / "inputs" / "limitations.md").write_text("# Limitations\n\n- Cross-sectional\n", encoding="utf-8")
+    p = orchestrator.Project(root)
+    p.save_claims(ClaimTable(section_id="discussion", approved=True, claims=[c.model_copy() for c in CLAIMS]))
+    p.set_status("discussion", "APPROVED")
+    yield root
+    agents.LLM = None
+    agents.CONFIG = {}
+
+
+def fake_search(queries):
+    """Stands in for scholar.search: the same five papers for every query, and a note of what was asked."""
+    def search(query, limit=5, cache_dir=None, fresh=False):
+        queries.append(query)
+        return [dict(found) for found in (SUPPORT, AGAINST, NO_ABSTRACT, OFF_TOPIC, KNOWN)]
+    return search
+
+
+def model(calls=None):
+    """A model that writes searches for C1 only, and judges papers by their titles."""
+    def llm(system, user, schema):
+        if calls is not None:
+            calls.append(schema.__name__)
+        if schema is SearchList:
+            return SearchList(searches=[Searches(claim_id="C1", supporting="sleep duration memory adolescents",
+                                                 contradicting="sleep memory no-association null",
+                                                 alternative="sleep memory confounding income")])
+        assert schema is Assessment
+        numbers = {title: int(n) for n, title in re.findall(r"^\[(\d+)\] (.+?) \(", user, re.M)}
+        verdicts = [
+            Verdict(paper=numbers[SUPPORT["title"]], stance="supports", note="A cohort of adolescents showed the same pattern.",
+                    quote="Longer sleep was associated with better memory scores."),
+            Verdict(paper=numbers[AGAINST["title"]], stance="Contradicts", note="A large adult sample showed no such link.",
+                    quote="we found no association between sleep duration and memory performance"),
+            Verdict(paper=numbers[OFF_TOPIC["title"]], stance="unrelated"),
+            Verdict(paper=numbers[KNOWN["title"]], stance="supports", note="It agrees.",
+                    quote="Sleep strongly improves memory in every age group."),             # not in the abstract
+            Verdict(paper=99, stance="supports", quote="made up", note="made up"),
+        ]
+        return Assessment(verdicts=verdicts, alternatives=[Alternative(
+            interpretation=INTERPRETATION, kind="Confounding", papers=[numbers[SUPPORT["title"]], 99],
+            check="Adjusting for household income would separate the two readings.")])
+    return llm
+
+
+def never(system, user, schema):
+    raise AssertionError("the model must not be called")
+
+
+def stored(root):
+    return json.loads((root / "state" / "evidence" / "discussion.json").read_text(encoding="utf-8"))
+
+
+def searched(root, monkeypatch, queries=None):
+    monkeypatch.setattr(scholar, "search", fake_search(queries if queries is not None else []))
+    agents.LLM = model()
+    return evidence.search(root, "discussion")
+
+
+def test_a_label_is_kept_only_if_its_quote_is_in_the_abstract(project, monkeypatch):
+    queries = []
+    got = searched(project, monkeypatch, queries)
+    assert got["failed"] == []
+    findings = stored(project)["findings"]
+    assert [f["claim_id"] for f in findings] == ["C1", "C2"]                 # the ASSUMED claim is not searched
+    first = findings[0]
+    assert [(row["id"], row["paper_id"], row["stance"]) for row in first["papers"]] == [
+        ("E1", "p1", "supports"), ("E2", "p2", "contradicts"), ("E3", "p5", "unclear"), ("E4", "p3", "not screened")]
+    assert first["papers"][0]["quote"] == "Longer sleep was associated with better memory scores."
+    assert first["papers"][2]["quote"] == "" and first["papers"][2]["in_library"] == "lee2019"   # found by its DOI
+    assert first["unrelated"] == 1 and all(row["decision"] == "" for row in first["papers"])
+    assert first["alternatives"] == [{"id": "A1", "interpretation": INTERPRETATION, "kind": "confounding",
+                                      "check": "Adjusting for household income would separate the two readings.",
+                                      "papers": ["E1"], "decision": "", "claim": ""}]
+    assert [row["id"] for row in findings[1]["papers"]] == ["E5", "E6", "E7", "E8"]
+
+    assert queries[:3] == ["sleep duration memory adolescents", "sleep memory no association null",
+                           "sleep memory confounding income"]                # as cleaned: no hyphen
+    assert queries[3] == "Sleep may support memory consolidation in adolescents."     # C2: the model wrote no search
+
+    report = (project / "build" / "evidence_discussion.md").read_text(encoding="utf-8")
+    assert "### Supports (1)" in report and "### Contradicts (1)" in report and "### Other interpretations" in report
+    assert "### Not screened: no abstract available (1)" in report and "In your library as [@lee2019]" in report
+    assert "- [ ] E1  Ana Smith, Bo Jones (2020). Sleep and memory in adolescents. Journal of Sleep." in report
+
+
+def test_no_claim_table_and_a_dead_search_service_are_said_plainly(project, monkeypatch, capsys):
+    def down(query, limit=5, cache_dir=None, fresh=False):
+        raise scholar.SearchError("Semantic Scholar is not answering (HTTP 429, 3 tries). " + scholar.KEY_HINT)
+
+    monkeypatch.setattr(scholar, "search", down)
+    agents.LLM = model()
+    assert main(["--root", str(project), "evidence", "search", "discussion"]) == 1
+    out = capsys.readouterr().out
+    assert "failed: C1: Semantic Scholar is not answering" in out and "SEMANTIC_SCHOLAR_API_KEY" in out
+    assert out.count("  failed: ") == 1                               # it did not go on to hammer the service for C2
+
+    (project / "state" / "claims" / "discussion.json").unlink()
+    assert main(["--root", str(project), "evidence", "search"]) == 1          # one section: its name can be left out
+    assert "No claim table for 'discussion'. Plan the section first" in capsys.readouterr().out
+
+
+def test_accepted_suggestions_reach_the_claim_table_only_through_the_library(project, monkeypatch, capsys):
+    searched(project, monkeypatch)
+    answers = iter(["y", "y", "n", "l", "y", "q"])                    # E1, E2 accepted; E3 rejected; E4 later; A1 accepted
+    printed = []
+    assert evidence.run(project, "review", "discussion", ask=lambda prompt: next(answers), out=printed.append) == 0
+    text = "\n".join(printed)
+    assert "1 of 10, for C1:" in text and "3 suggestion(s) accepted." in text
+    rows = {row["id"]: row for f in stored(project)["findings"] for row in f["papers"] + f["alternatives"]}
+    assert [rows[i]["decision"] for i in ("E1", "E2", "E3", "E4", "A1", "E5")] == [
+        "accepted", "accepted", "rejected", "", "accepted", ""]
+
+    # the two accepted papers are not in the library yet: a .bib file to import, and no claim cites them
+    suggested = (project / "refs" / "suggested.bib").read_text(encoding="utf-8")
+    assert "@article{smith2020sleep," in suggested and "@article{kim2021link," in suggested
+    assert "2 accepted paper(s) are not in refs/library.bib yet" in text and "New claims in the claim table: C4" in text
+    p = orchestrator.Project(project)
+    table = p.load_claims("discussion")
+    assert [(c.id, c.category, c.cite_keys, c.origin) for c in table.claims[3:]] == [
+        ("C4", "SPECULATIVE", [], "evidence search")] and table.claims[3].text == INTERPRETATION
+    assert table.approved is False and p.status()["discussion"] == "AWAITING_APPROVAL"
+    assert BIB == (project / "refs" / "library.bib").read_text(encoding="utf-8")       # the library was not touched
+
+    # Zotero exports the same papers under its own keys: they are found by DOI
+    (project / "refs" / "library.bib").write_text(
+        BIB + "@article{smithSleepMemory2020,\n  title = {Sleep and memory in adolescents},\n  doi = {10.1000/sleep.1},\n}\n"
+        "@article{kimNoLink2021,\n  title = {No link between sleep and memory in adults},\n"
+        "  doi = {https://doi.org/10.1000/SLEEP.2},\n}\n", encoding="utf-8")
+    assert main(["--root", str(project), "evidence", "apply", "discussion"]) == 0
+    out = capsys.readouterr().out
+    assert "New claims in the claim table: C5, C6" in out and "Sources added to claims: C4" in out
+    assert "Wiki pages written" in out and "paperkit approve discussion" in out
+    table = orchestrator.Project(project).load_claims("discussion")
+    added = {c.id: c for c in table.claims[3:]}
+    assert added["C4"].cite_keys == ["smithSleepMemory2020"]          # the paper its interpretation rests on
+    assert added["C5"].cite_keys == ["smithSleepMemory2020"] and added["C5"].category == "INFERRED"
+    assert added["C5"].text == ("Earlier work agrees with our finding (Longer sleep was associated with better memory): "
+                                "A cohort of adolescents showed the same pattern.")
+    assert added["C6"].cite_keys == ["kimNoLink2021"] and added["C6"].text.startswith("Earlier work disagrees with our finding")
+    p = orchestrator.Project(project)
+    assert blocking(check_claims(table, p.facts, set(p.bib))) == []
+    page = (project / "wiki" / "smithSleepMemory2020.md").read_text(encoding="utf-8")
+    assert "## Key findings" in page and '> "Longer sleep was associated with better memory scores." (abstract)' in page
+    assert "[[kimNoLink2021]]" in (project / "wiki" / "index.md").read_text(encoding="utf-8")
+    assert not (project / "refs" / "suggested.bib").exists()
+
+    assert main(["--root", str(project), "evidence", "apply", "discussion"]) == 0      # repeating it adds nothing
+    assert "Nothing to carry over" in capsys.readouterr().out
+    table.claims = [c for c in table.claims if c.id != "C6"]          # you delete a claim: it does not come back
+    p.save_claims(table)
+    assert main(["--root", str(project), "evidence", "apply", "discussion"]) == 0
+    assert [c.id for c in orchestrator.Project(project).load_claims("discussion").claims] == ["C1", "C2", "C3", "C4", "C5"]
+
+
+def test_accept_by_id_can_add_the_paper_to_a_library_kept_by_hand(project, monkeypatch, capsys):
+    searched(project, monkeypatch)
+    assert main(["--root", str(project), "evidence", "accept", "E1", "--add-to-library"]) == 0     # section left out
+    out = capsys.readouterr().out
+    assert "1 suggestion(s) accepted." in out and "Added to refs/library.bib: smith2020sleep" in out
+    bib = zotero.load_bib(project / "refs" / "library.bib")
+    assert bib["smith2020sleep"]["doi"] == "10.1000/sleep.1" and bib["smith2020sleep"]["author"] == "Ana Smith and Bo Jones"
+    assert "lee2019" in bib
+    table = orchestrator.Project(project).load_claims("discussion")
+    assert table.claims[-1].cite_keys == ["smith2020sleep"] and (project / "wiki" / "smith2020sleep.md").exists()
+    assert main(["--root", str(project), "evidence", "reject", "discussion", "E99"]) == 1
+    assert "No such suggestion: E99" in capsys.readouterr().out
+    assert main(["--root", str(project), "evidence", "list", "discussion"]) == 0
+    out = capsys.readouterr().out
+    assert "[x] E1  supports: Ana Smith, Bo Jones (2020)" in out and "1 of 8 paper(s) and 0 of 2 interpretation(s) accepted" in out
+
+
+def test_a_second_search_asks_the_model_nothing_and_keeps_your_decisions(project, monkeypatch):
+    searched(project, monkeypatch)
+    evidence.decide(project, "discussion", ["E2", "A1"], "accepted")
+    before = stored(project)
+    agents.LLM = never                                                # every answer comes from .cache/evidence/
+    said = []
+    evidence.search(project, "discussion", say=said.append)
+    after = stored(project)
+    assert [[(r["id"], r["decision"]) for r in f["papers"] + f["alternatives"]] for f in after["findings"]] == \
+           [[(r["id"], r["decision"]) for r in f["papers"] + f["alternatives"]] for f in before["findings"]]
+    calls = []
+    agents.LLM = model(calls)
+    evidence.search(project, "discussion", fresh=True)                # --fresh asks again
+    assert calls == ["SearchList", "Assessment", "Assessment"]
+
+
+def test_claims_added_by_the_search_are_not_searched_and_the_planner_cannot_fake_their_mark(project, monkeypatch):
+    table = orchestrator.Project(project).load_claims("discussion")
+    table.claims.append(Claim(id="C4", text="Earlier work agrees.", category="INFERRED", origin="evidence search"))
+    assert [c.id for c in evidence.targets(table)] == ["C1", "C2"]
+    agents.LLM = lambda system, user, schema: ClaimList(claims=[c.model_copy(update={"origin": "evidence search"}) for c in CLAIMS])
+    planned, _ = orchestrator.plan(orchestrator.Project(project), "discussion")
+    assert [c.origin for c in planned.claims] == ["", "", ""]
+
+
+def api_record(found):
+    return {"paperId": found["paper_id"], "title": found["title"], "abstract": found["abstract"] or None,
+            "year": found["year"], "venue": found["venue"], "citationCount": found["citations"],
+            "url": f"https://www.semanticscholar.org/paper/{found['paper_id']}",
+            "externalIds": {"DOI": found["doi"].upper(), "CorpusId": 1} if found["doi"] else {"CorpusId": 1},
+            "authors": [{"authorId": "1", "name": name} for name in found["authors"]]}
+
+
+def test_the_client_paces_retries_caches_and_reads_the_api_format(project, monkeypatch, tmp_path):
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = urlparse(self.path)
+            seen.append((url.path, parse_qs(url.query), self.headers.get("x-api-key")))
+            status = 403 if url.path.startswith("/denied/") else 429 if url.path.startswith("/busy/") or len(seen) == 1 else 200
+            body = json.dumps({"total": 2, "offset": 0, "data": [api_record(SUPPORT), api_record(NO_ABSTRACT),
+                                                                   {"paperId": None, "title": "no id"}]}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body if status == 200 else b'{"message": "Too Many Requests"}')
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        monkeypatch.setenv("SEMANTIC_SCHOLAR_BASE_URL", base + "/graph/v1/")
+        monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "s2-key")
+        papers = scholar.search('"sleep-duration" AND memory', 7, tmp_path / "cache")
+        assert [p["paper_id"] for p in papers] == ["p1", "p3"]                # the record with no id is dropped
+        assert papers[0] == SUPPORT and papers[1]["abstract"] == ""            # same shape, DOI in lower case
+        assert len(seen) == 2 and seen[0][0] == "/graph/v1/paper/search"       # one 429, then the answer
+        assert seen[1][1]["query"] == ["sleep duration AND memory"] and seen[1][1]["limit"] == ["7"]
+        assert "abstract" in seen[1][1]["fields"][0] and seen[1][2] == "s2-key"
+        assert scholar.search('"sleep-duration" AND memory', 7, tmp_path / "cache") == papers and len(seen) == 2    # from the cache
+
+        monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "")
+        monkeypatch.setenv("SEMANTIC_SCHOLAR_BASE_URL", base + "/busy/")
+        with pytest.raises(scholar.SearchError, match="not answering .HTTP 429, 3 tries.. Without a key"):
+            scholar.search("sleep memory")
+        assert seen[-1][2] is None                                             # no key, no header
+        monkeypatch.setenv("SEMANTIC_SCHOLAR_BASE_URL", base + "/denied/")
+        with pytest.raises(scholar.SearchError, match="rejected the key"):
+            scholar.search("sleep memory")
+    finally:
+        server.shutdown()
+
+
+def test_keys_and_entries_for_new_references(project):
+    found = record("p9", "The Sleep–Memory Link {revisited}", "", "10.1/x", authors=("José Álvarez-García",))
+    assert scholar.cite_key(found, []) == "alvarezgarcia2020sleep"
+    assert scholar.cite_key(found, ["alvarezgarcia2020sleep"]) == "alvarezgarcia2020sleepa"
+    entry = scholar.bibtex(found, "alvarezgarcia2020sleep")
+    assert "title = {The Sleep–Memory Link revisited}," in entry and entry.endswith("\n}\n")
+    assert scholar.library_key({"k1": {"title": "the sleep memory link revisited"}}, {**found, "doi": ""}) == "k1"
+    assert scholar.library_key({"k1": {"title": "Something else"}}, found) == ""
+
+
+def test_menu_entry_searches_reviews_and_carries_over(project, monkeypatch):
+    monkeypatch.setattr(scholar, "search", fake_search([]))
+    agents.LLM = model()
+    assert "e" in wizard.MENU and set(wizard.MENU) == set(wizard.ACTIONS) | {"q"}
+    feed, printed = iter(["x", "y"]), []                                       # search, and yes to the API call
+    ui = wizard.UI(ask=lambda prompt="": next(feed), out=lambda text="": printed.append(str(text)), color=False)
+    wizard.act_evidence(ui, project)
+    assert any("8 paper(s) and 2 other interpretation(s) for 2 claim(s)" in row for row in printed)
+
+    feed = iter(["a", "y", "q"])                                               # review: accept E1, then stop
+    wizard.act_evidence(ui, project)
+    feed = iter(["p", "y"])                                                    # carry over, adding the paper to library.bib
+    wizard.act_evidence(ui, project)
+    assert any("Added to refs/library.bib: smith2020sleep" in row for row in printed)
+    table = orchestrator.Project(project).load_claims("discussion")
+    assert table.claims[-1].origin == "evidence search" and table.approved is False
+    shown = []
+    wizard.show_claims(wizard.UI(out=shown.append, color=False), table)
+    assert any("added by the evidence search" in row for row in shown)
+'''
+
+
 ENV_TEXT = """# GitHub (used by publish.sh)
 GITHUB_USER=
 GITHUB_TOKEN=
@@ -5341,6 +6573,9 @@ VISIBILITY=private
 # Model providers (used by paperkit)
 NVIDIA_API_KEY=
 ANTHROPIC_API_KEY=
+
+# Literature search (paperkit evidence). Free key: semanticscholar.org/product/api. Works without, but is often refused.
+SEMANTIC_SCHOLAR_API_KEY=
 
 # Optional: one provider and model for every agent, instead of config/models.yaml
 # PAPERKIT_PROVIDER=nvidia

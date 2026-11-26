@@ -110,7 +110,7 @@ class Ping(BaseModel):
 def ping_all() -> list[tuple[str, str, str, str]]:
     """One tiny request per distinct provider and model in use: (agents, provider, model, 'ok' or the error)."""
     routes: dict[tuple[str, str], list[str]] = {}
-    for kind in (*PIPELINE_AGENTS, "facts", "rules"):    # the models behind `extract facts` and `rules extract`
+    for kind in (*PIPELINE_AGENTS, "facts", "rules", "literature"):    # also the models behind extract, rules, evidence
         routes.setdefault(route(kind), []).append(kind)
     rows = []
     for (provider, model), kinds in routes.items():
@@ -207,6 +207,7 @@ Code checks the draft and rejects it on any violation:
 - No "novel", "first", "proves", "clearly", "robust". Never "no effect": say "we did not detect".
 - If something you need is missing, write [AUTHOR: what is missing] or [NEEDS SOURCE: what for]. Do not fill the gap yourself.
 - If <starting_draft> is given, follow it: keep text marked [KEEP] word for word (it still needs its claim tag), make the change at each [CHANGE: ...], and write each [WRITE: ...] from the claims. Never copy the markers [KEEP], [CHANGE: ...] or [WRITE: ...] into your draft.
+- Stay within max_words of <section>: the words are counted. If a draft comes back as too long, cut to the targets given with that problem, and say each claim once instead of in several paragraphs.
 - If <writing_rules> is given, follow every rule in it: they come from the journal's and other writing guides, and the author approved them. Where one of them conflicts with the rules above, the rules above win."""
 
 OBSERVATIONAL = """

@@ -38,6 +38,7 @@ class Claim(BaseModel):
     fact_ids: list[str] = Field(default_factory=list, description="Ids from the facts registry")
     cite_keys: list[str] = Field(default_factory=list, description="Citation keys from the library")
     assumptions: list[str] = Field(default_factory=list, description="What this claim depends on")
+    origin: str = Field(default="", description="Leave empty. Code fills it in for claims that the evidence search added.")
 
 
 class ClaimList(BaseModel):

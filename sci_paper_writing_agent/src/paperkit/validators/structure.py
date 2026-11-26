@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 
+from .. import shorten
 from ..schemas import Issue
 from .common import GateContext, headings, plain, short
 
@@ -30,5 +31,7 @@ def check(draft: str, ctx: GateContext) -> list[Issue]:
     if words == 0:
         issues.append(Issue(gate="structure", message="Draft is empty"))
     if words > ctx.sec.max_words:
-        issues.append(Issue(gate="structure", message=f"Too long: {words} words, limit {ctx.sec.max_words}"))
+        found = shorten.analyse(draft, ctx.sec.max_words)      # how much to cut and where: sent back to the writer
+        issues.append(Issue(gate="structure", message=f"Too long: {words} words, limit {ctx.sec.max_words}",
+                            excerpt=shorten.hint(found) if found else ""))
     return issues

@@ -112,6 +112,7 @@ def plan(p: Project, sec_id: str, say=_quiet) -> tuple[ClaimTable, list[Issue]]:
             methods=p.inp("methods"), results=p.inp("results"), introduction=p.inp("introduction"), fact_reg=p.facts,
             starting_draft=p.draft(sec_id),
             library=zotero.library_listing(p.bib), wiki_index=wiki.index(p.root / "wiki"), issues=issues)
+        claims = [c.model_copy(update={"origin": ""}) for c in claims]     # only code marks where a claim came from
         table = ClaimTable(section_id=sec_id, approved=False, claims=claims)
         issues = blocking(check_claims(table, p.facts, set(p.bib)))
         say(f"  planner  done in {time.monotonic() - started:.0f} s: {len(claims)} claims")
@@ -198,6 +199,9 @@ def run_section(p: Project, sec_id: str, say=_quiet) -> str:
 
     _dump(reviews / f"{sec_id}.open.json", _rows(issues))   # hand over to a person; never accept silently
     say(f"{sec_id}: {len(issues)} problem(s) left after {rounds} rounds -> state/reviews/{sec_id}.open.json")
+    if any(i.message.startswith("Too long") for i in issues):
+        say("  The draft is over its word limit: the build (menu 7, or `paperkit build`) writes where to "
+            "shorten it into build/report.md")
     return p.set_status(sec_id, "ESCALATED")
 
 

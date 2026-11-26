@@ -392,6 +392,26 @@ def test_start_screen_offers_to_draft_facts_and_messages(fresh):
     assert any("a model drafted them" in row for row in printed)
 
 
+def test_menu_drafts_facts_and_key_messages_and_asks_before_replacing(fresh):
+    assert set(wizard.MENU) == set(wizard.ACTIONS) | {"q"}               # every menu line has its action
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(facts=["n = 412"], messages=["Y varies by age group."])
+    ui, printed = scripted(["y"])                                        # the files are placeholders: only the API question
+    wizard.ACTIONS["f"](ui, fresh)
+    ui, printed_k = scripted(["y"])
+    wizard.ACTIONS["k"](ui, fresh)
+    assert status(fresh)["facts"] is True and status(fresh)["key_messages"] is True
+    assert any("F1   n = 412" in row for row in printed) and any("Y varies by age group." in row for row in printed_k)
+
+    agents.LLM = fake_model(facts=["r = 0.29"], messages=["X is associated with Y."])
+    ui, printed = scripted(["n"])                                        # real content now: asked first, and "no" keeps it
+    wizard.ACTIONS["f"](ui, fresh)
+    assert "n = 412" in (fresh / "inputs" / "facts.csv").read_text(encoding="utf-8")
+    ui, printed = scripted(["y", "y"])                                   # yes to replacing, yes to the API call
+    wizard.ACTIONS["f"](ui, fresh)
+    assert "r = 0.29" in (fresh / "inputs" / "facts.csv").read_text(encoding="utf-8")
+
+
 DRAFT_EMPTY = "<!--\nHOW TO USE\n[WRITE: an example inside the comment]\n-->\n\n## Principal findings\n\n## Limitations\n"
 DRAFT_REAL = ("<!--\nHOW TO USE\n-->\n\n## Principal findings\n\nX tracks Y ({{F1}}). [KEEP]\n\n"
               "[WRITE: one paragraph on age differences]\n\nThis is not hedged. [CHANGE: hedge this]\n")

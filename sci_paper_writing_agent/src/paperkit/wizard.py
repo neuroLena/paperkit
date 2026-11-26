@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, zotero
+from . import agents, build, dryrun, env, evidence, extract, facts, orchestrator, preflight, zotero
 from .ingestion import rules_ingest
 from .schemas import ClaimTable, Issue
 from .validators import blocking
@@ -39,7 +39,10 @@ MENU = {
     "7": "Build the paper and the report",
     "8": "Show section statuses",
     "9": "Choose the model provider and test the connection",
-    "r": "Writing rules from the guides in .writing_guides  (reading them calls the API)",
+    "f": "Draft facts.csv from the Results section           (calls the API)",
+    "k": "Draft key_messages.md from the Results section     (calls the API)",
+    "r": "Writing rules from the guides in .writing_guides   (reading them calls the API)",
+    "e": "Search the literature for a section's claims       (calls the API and Semantic Scholar)",
     "q": "Quit",
 }
 
@@ -377,7 +380,8 @@ def show_claims(ui: UI, table: ClaimTable) -> None:
         ui.out(f"  {c.id:<4}{c.category:<12}{c.text}")
         extra = [f"facts: {', '.join(c.fact_ids)}" if c.fact_ids else "",
                  f"cites: {', '.join(c.cite_keys)}" if c.cite_keys else "",
-                 f"assumes: {'; '.join(c.assumptions)}" if c.assumptions else ""]
+                 f"assumes: {'; '.join(c.assumptions)}" if c.assumptions else "",
+                 "added by the evidence search" if c.origin else ""]
         if any(extra):
             ui.out("      " + "   ".join(e for e in extra if e))
 
@@ -563,8 +567,52 @@ def act_rules(ui: UI, root: Path) -> None:
         rules_ingest.run(root, "list", out=ui.out)
 
 
+def act_evidence(ui: UI, root: Path) -> None:
+    p = _project(ui, root)
+    if p is None:
+        return
+    sec_id = _section(ui, p)
+    found = evidence.counts(evidence.load(root, sec_id))
+    ui.out(f"{sec_id}: {found['papers']} suggested paper(s), {found['accepted']} accepted; {found['alternatives']} other "
+           f"interpretation(s), {found['alternatives_accepted']} accepted; {found['open']} not decided.")
+    choice = ui.choose("What now?", {
+        "x": "search the literature for this section's claims (calls the API and Semantic Scholar)",
+        "a": "go through the suggestions that have no decision yet",
+        "p": "carry the accepted suggestions into the claim table",
+        "l": "list all suggestions", "b": "back"}, default="b")
+    if choice == "x" and _confirm_api(ui, "literature"):
+        evidence.run(root, "search", sec_id, out=ui.out)
+    elif choice == "a":
+        evidence.run(root, "review", sec_id, out=ui.out, ask=ui.ask)
+    elif choice == "p":
+        add = evidence.missing_from_library(root, sec_id) > 0 and ui.confirm(
+            "Some accepted papers are not in refs/library.bib. Add them to that file now? "
+            "Say no if Zotero writes it: import refs/suggested.bib into Zotero instead.", False)
+        evidence.run(root, "apply", sec_id, add_to_library=add, out=ui.out)
+    elif choice == "l":
+        evidence.run(root, "list", sec_id, out=ui.out)
+
+
+def _draft_from_results(ui: UI, root: Path, what: str) -> None:
+    """Menu f and k: the same drafting step that the input checklist offers, reachable at any time."""
+    name = "inputs/facts.csv" if what == "facts" else "inputs/key_messages.md"
+    untouched = extract.facts_are_default(root) if what == "facts" else extract.messages_are_default(root)
+    if not untouched and not ui.confirm(f"{name} already has content and will be replaced. Continue?", False):
+        return
+    draft_with_model(ui, root, what)
+
+
+def act_facts(ui: UI, root: Path) -> None:
+    _draft_from_results(ui, root, "facts")
+
+
+def act_key_messages(ui: UI, root: Path) -> None:
+    _draft_from_results(ui, root, "key-messages")
+
+
 ACTIONS = {"1": act_inputs, "2": act_dry_run, "3": act_plan, "4": act_approve,
-           "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models, "r": act_rules}
+           "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models,
+           "f": act_facts, "k": act_key_messages, "r": act_rules, "e": act_evidence}
 
 
 def menu(ui: UI, root: Path) -> int:

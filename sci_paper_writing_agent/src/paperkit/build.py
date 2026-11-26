@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
-from . import facts
+from . import facts, shorten
 from .schemas import Issue, PaperSpec
 from .validators.common import COMMENT, MARKER
 
@@ -47,8 +48,38 @@ def pandoc(md_path: Path, root: Path, spec: PaperSpec) -> Path | None:
     return out
 
 
+def latest_draft(root: Path, sec_id: str) -> Path | None:
+    """The finished draft of a section, or the draft of its last round if it never finished."""
+    final = root / "drafts" / f"{sec_id}.md"
+    if final.exists():
+        return final
+    rounds = [(int(m.group(1)), f) for f in (root / "drafts").glob(f"{sec_id}.r*.md")
+              if (m := re.fullmatch(rf"{re.escape(sec_id)}\.r(\d+)", f.stem))]
+    return max(rounds)[1] if rounds else None
+
+
+def where_to_shorten(root: Path, spec: PaperSpec) -> list[str]:
+    """Report lines for every section whose latest draft is over its word limit. Counting only, no model."""
+    lines: list[str] = []
+    for sec in spec.sections:
+        path = latest_draft(root, sec.id)
+        found = shorten.analyse(path.read_text(encoding="utf-8"), sec.max_words) if path else None
+        if not found:
+            continue
+        try:
+            table = json.loads((root / "state" / "claims" / f"{sec.id}.json").read_text(encoding="utf-8"))
+            claims = len(table.get("claims") or [])
+        except (OSError, ValueError, AttributeError):
+            claims = 0
+        own = root / "inputs" / f"{sec.id}_draft.md"
+        text = own.read_text(encoding="utf-8") if own.is_file() else ""
+        lines += [""] + shorten.report_lines(sec.id, path.relative_to(root).as_posix(), found, claims,
+                                             shorten.kept_words(text), shorten.own_words(text))
+    return lines
+
+
 def report(root: Path, spec: PaperSpec, status: dict[str, str], issues: list[Issue]) -> Path:
-    """build/report.md: section statuses and everything left open for a person."""
+    """build/report.md: section statuses, everything left open for a person, and where to shorten a long draft."""
     lines = [f"# Report: {spec.title}", "", "## Sections", ""]
     lines += [f"- {sec.id}: {status.get(sec.id, 'NEW')}" for sec in spec.sections]
     lines += ["", "## Open issues", ""]
@@ -60,6 +91,7 @@ def report(root: Path, spec: PaperSpec, status: dict[str, str], issues: list[Iss
                 rows.append(f"- [escalated] {sec.id} / {item['gate']}: {item['message']}"
                             + (f" | {item['excerpt']}" if item.get("excerpt") else ""))
     lines += rows or ["- none"]
+    lines += where_to_shorten(root, spec)
     out = root / "build" / "report.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
