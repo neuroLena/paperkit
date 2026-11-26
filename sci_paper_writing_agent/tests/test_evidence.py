@@ -79,7 +79,7 @@ def project(tmp_path, monkeypatch):
 
 def fake_search(queries):
     """Stands in for scholar.search: the same five papers for every query, and a note of what was asked."""
-    def search(query, limit=5, cache_dir=None, fresh=False):
+    def search(query, limit=5, cache_dir=None, fresh=False, notify=None):
         queries.append(query)
         return [dict(found) for found in (SUPPORT, AGAINST, NO_ABSTRACT, OFF_TOPIC, KNOWN)]
     return search
@@ -154,7 +154,7 @@ def test_a_label_is_kept_only_if_its_quote_is_in_the_abstract(project, monkeypat
 
 
 def test_no_claim_table_and_a_dead_search_service_are_said_plainly(project, monkeypatch, capsys):
-    def down(query, limit=5, cache_dir=None, fresh=False):
+    def down(query, limit=5, cache_dir=None, fresh=False, notify=None):
         raise scholar.SearchError("Semantic Scholar is not answering (HTTP 429, 3 tries). " + scholar.KEY_HINT)
 
     monkeypatch.setattr(scholar, "search", down)
@@ -331,7 +331,9 @@ def test_the_client_paces_retries_caches_and_reads_the_api_format(project, monke
         base = f"http://127.0.0.1:{server.server_port}"
         monkeypatch.setenv("SEMANTIC_SCHOLAR_BASE_URL", base + "/graph/v1/")
         monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "s2-key")
-        papers = scholar.search('"sleep-duration" AND memory', 7, tmp_path / "cache")
+        waits = []
+        papers = scholar.search('"sleep-duration" AND memory', 7, tmp_path / "cache", notify=waits.append)
+        assert waits == ["Semantic Scholar says wait (HTTP 429): trying again in 0 s, try 2 of 3"]
         assert [p["paper_id"] for p in papers] == ["p1", "p3"]                # the record with no id is dropped
         assert papers[0] == SUPPORT and papers[1]["abstract"] == ""            # same shape, DOI in lower case
         assert len(seen) == 2 and seen[0][0] == "/graph/v1/paper/search"       # one 429, then the answer

@@ -23,7 +23,8 @@ from pathlib import Path
 BASE_URL = "https://api.semanticscholar.org/graph/v1"      # SEMANTIC_SCHOLAR_BASE_URL overrides it
 FIELDS = "title,abstract,year,authors,venue,externalIds,citationCount,url"
 PAUSE = 1.1                     # seconds between requests: a key allows one request per second
-BACKOFF = (3, 8, 20, 40)        # waits after HTTP 429 or 5xx: the API sends no Retry-After
+BACKOFF = (5, 10, 20, 40, 60, 60, 60)   # waits after HTTP 429 or 5xx, about four minutes in all: the API sends
+                                        # no Retry-After, and a refusal often passes if the client just waits
 TIMEOUT = 30
 KEY_HINT = ("Without a key, Semantic Scholar often turns searches away. Request a free key at "
             "semanticscholar.org/product/api and put SEMANTIC_SCHOLAR_API_KEY=... in .env.")
@@ -40,14 +41,17 @@ def has_key() -> bool:
     return bool((os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or "").strip())
 
 
-def _get(url: str) -> dict:
-    """One paced GET. HTTP 429 and 5xx are both the service saying "not now": wait and try again."""
+def _get(url: str, notify=None) -> dict:
+    """One paced GET. HTTP 429 and 5xx are both the service saying "not now": wait and try again.
+
+    `notify` gets a line each time it waits, so a long wait does not look like a program that hangs.
+    """
     global _last
     key = (os.environ.get("SEMANTIC_SCHOLAR_API_KEY") or "").strip()
     headers = {"Accept": "application/json", "User-Agent": "paperkit (literature search for a manuscript)"}
     if key:
         headers["x-api-key"] = key
-    for wait in (*BACKOFF, None):
+    for attempt, wait in enumerate((*BACKOFF, None), 1):
         gap = PAUSE - (time.monotonic() - _last)
         if gap > 0:
             time.sleep(gap)
@@ -59,6 +63,9 @@ def _get(url: str) -> dict:
             detail = " ".join(exc.read().decode("utf-8", "replace").split())[:200]
             busy = exc.code == 429 or exc.code >= 500
             if busy and wait is not None:
+                if notify:
+                    notify(f"Semantic Scholar says wait (HTTP {exc.code}): trying again in {wait} s, "
+                           f"try {attempt + 1} of {len(BACKOFF) + 1}")
                 time.sleep(wait)
                 continue
             if exc.code in (401, 403):
@@ -103,7 +110,7 @@ def clean_query(query: str, words: int = 12) -> str:
     return " ".join(text.split()[:words])
 
 
-def search(query: str, limit: int = 5, cache_dir: Path | None = None, fresh: bool = False) -> list[dict]:
+def search(query: str, limit: int = 5, cache_dir: Path | None = None, fresh: bool = False, notify=None) -> list[dict]:
     """The papers the relevance search returns for a query, best match first."""
     query = clean_query(query)
     if not query:
@@ -116,7 +123,8 @@ def search(query: str, limit: int = 5, cache_dir: Path | None = None, fresh: boo
             return json.loads(cache.read_text(encoding="utf-8"))
         except ValueError:
             pass
-    data = _get(f"{base}/paper/search?" + urllib.parse.urlencode({"query": query, "limit": limit, "fields": FIELDS}))
+    data = _get(f"{base}/paper/search?" + urllib.parse.urlencode({"query": query, "limit": limit, "fields": FIELDS}),
+                notify)
     rows = data.get("data") if isinstance(data, dict) else None
     papers = [found for found in map(paper, rows or []) if found]
     if cache:

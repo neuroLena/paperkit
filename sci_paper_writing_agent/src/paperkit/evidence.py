@@ -248,7 +248,8 @@ def search(root: str | Path, sec_id: str, fresh: bool = False, say=lambda text: 
             for kind in KINDS:
                 if kind != "supporting" and queries[kind] in [queries[k] for k in KINDS[:KINDS.index(kind)]]:
                     continue
-                for found in scholar.search(queries[kind], limit, cache_dir, fresh):
+                for found in scholar.search(queries[kind], limit, cache_dir, fresh,
+                                            notify=lambda text: say(f"{where}: {text}")):
                     papers.setdefault(found["paper_id"], {**found, "found_by": []})["found_by"].append(kind)
         except scholar.SearchError as exc:
             failed.append(f"{claim.id}: {_line(exc, 300)}")
