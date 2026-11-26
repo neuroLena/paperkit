@@ -708,6 +708,7 @@ Code checks the draft and rejects it on any violation:
 - No "novel", "first", "proves", "clearly", "robust". Never "no effect": say "we did not detect".
 - If something you need is missing, write [AUTHOR: what is missing] or [NEEDS SOURCE: what for]. Do not fill the gap yourself.
 - If <starting_draft> is given, follow it: keep text marked [KEEP] word for word (it still needs its claim tag), make the change at each [CHANGE: ...], and write each [WRITE: ...] from the claims. Never copy the markers [KEEP], [CHANGE: ...] or [WRITE: ...] into your draft.
+- Stay within max_words of <section>: the words are counted. If a draft comes back as too long, cut to the targets given with that problem, and say each claim once instead of in several paragraphs.
 - If <writing_rules> is given, follow every rule in it: they come from the journal's and other writing guides, and the author approved them. Where one of them conflicts with the rules above, the rules above win."""
 
 OBSERVATIONAL = """
@@ -933,6 +934,7 @@ from __future__ import annotations
 
 import re
 
+from .. import shorten
 from ..schemas import Issue
 from .common import GateContext, headings, plain, short
 
@@ -960,7 +962,9 @@ def check(draft: str, ctx: GateContext) -> list[Issue]:
     if words == 0:
         issues.append(Issue(gate="structure", message="Draft is empty"))
     if words > ctx.sec.max_words:
-        issues.append(Issue(gate="structure", message=f"Too long: {words} words, limit {ctx.sec.max_words}"))
+        found = shorten.analyse(draft, ctx.sec.max_words)      # how much to cut and where: sent back to the writer
+        issues.append(Issue(gate="structure", message=f"Too long: {words} words, limit {ctx.sec.max_words}",
+                            excerpt=shorten.hint(found) if found else ""))
     return issues
 '''
 
@@ -1270,16 +1274,152 @@ def lint(wiki_dir: Path, bib_keys: set[str]) -> list[Issue]:
 # ----------------------------------------------------------------------------
 # src/paperkit/build.py
 # ----------------------------------------------------------------------------
+FILES['src/paperkit/shorten.py'] = r'''
+"""Where a draft that is over its word limit can be shortened. Counting only: no model is called.
+
+The same numbers are used twice. The report lists them for a person, and the structure gate sends a
+short form back to the writer together with the "Too long" problem.
+"""
+from __future__ import annotations
+
+import re
+from collections import Counter
+
+from .validators.common import COMMENT, HEADING, paragraphs, plain, short
+from .validators.language import FILLER
+
+LONG_SENTENCE = 35          # words: longer sentences are listed as candidates to trim
+THIN_CLAIM = 70             # words per claim: below this the claim table is too large for the limit
+KEEP = "[KEEP]"
+MARKS = re.compile(r"\[(?:WRITE|CHANGE)\b[^\]]*\]|\[KEEP\]")    # the marks of inputs/<section>_draft.md
+
+
+def words(md: str) -> int:
+    """The count the structure gate uses: no tags, citations, placeholders or heading marks."""
+    return len(plain(md).split())
+
+
+def by_heading(md: str) -> list[tuple[str, int]]:
+    """(heading, words under it) in the order of the draft."""
+    out: list[tuple[str, int]] = []
+    name, rows = "(before the first heading)", []
+
+    def close() -> None:
+        count = words("\n".join(rows))
+        if count:
+            out.append((name, count))
+
+    for line in md.splitlines():
+        found = HEADING.match(line)
+        if found:
+            close()
+            name, rows = found.group(2), []
+        else:
+            rows.append(line)
+    close()
+    return out
+
+
+def analyse(draft: str, limit: int) -> dict | None:
+    """None when the draft is within the limit. Otherwise how much is over, and where the words are."""
+    total = words(draft)
+    if total <= limit:
+        return None
+    paras = [(text, ids, words(text)) for text, ids in paragraphs(draft)]
+    in_paragraphs: dict[str, list[int]] = {}
+    for _, ids, count in paras:
+        for claim_id in dict.fromkeys(ids):
+            in_paragraphs.setdefault(claim_id, []).append(count)
+    repeated = sorted(((claim_id, len(counts), sum(counts)) for claim_id, counts in in_paragraphs.items()
+                       if len(counts) > 1), key=lambda row: -row[2])
+    long_sentences = sum(1 for text, _, _ in paras for sentence in re.split(r"(?<=[.!?])\s+", plain(text))
+                         if len(sentence.split()) > LONG_SENTENCE)
+    filler = Counter(m.group(0).lower() for m in FILLER.finditer(plain(draft)))
+    longest = sorted(paras, key=lambda row: -row[2])[:5]
+    return {
+        "total": total, "limit": limit, "over": total - limit, "percent": round(100 * (total - limit) / total),
+        "headings": [(name, count, round(count * limit / total)) for name, count in by_heading(draft)],
+        "longest": [(count, ids, short(COMMENT.sub("", text), 80)) for text, ids, count in longest],
+        "repeated": repeated, "long_sentences": long_sentences, "filler": filler.most_common(),
+    }
+
+
+def hint(found: dict) -> str:
+    """One line for the writer: how much to cut, the target under each heading, and the claims said twice."""
+    parts = [f"cut {found['over']} words ({found['percent']}%)"]
+    if found["headings"]:
+        parts.append("aim per heading: " + "; ".join(f"{name} {now} -> {target}" for name, now, target in found["headings"]))
+    if found["repeated"]:
+        parts.append("say each claim once: " + ", ".join(row[0] for row in found["repeated"][:8])
+                     + " take more than one paragraph")
+    return ". ".join(parts)
+
+
+def own_words(starting_draft: str) -> int:
+    """Words of the author's own text in inputs/<section>_draft.md, without its comment and its marks."""
+    return words(MARKS.sub("", COMMENT.sub("", starting_draft)))
+
+
+def kept_words(starting_draft: str) -> int:
+    """Words in the paragraphs of inputs/<section>_draft.md that carry a [KEEP] mark."""
+    text = COMMENT.sub("", starting_draft)
+    return sum(words(MARKS.sub("", block)) for block, _ in paragraphs(text) if KEEP in block)
+
+
+def report_lines(sec_id: str, source: str, found: dict, claims: int = 0, kept: int = 0, starting: int = 0) -> list[str]:
+    """The "Where to shorten" block of build/report.md for one section."""
+    limit = found["limit"]
+    lines = [f"## Where to shorten: {sec_id}", "",
+             f"The latest draft ({source}) has {found['total']} words. The limit is {limit}, "
+             f"so {found['over']} words ({found['percent']}%) have to go.", ""]
+    if found["headings"]:
+        lines += ["Words under each heading, with the target if every heading shrinks by the same share:", "",
+                  "| Heading | Now | Target | Cut |", "|---|---|---|---|"]
+        lines += [f"| {name} | {now} | {target} | {now - target} |" for name, now, target in found["headings"]]
+        lines.append("")
+    if found["longest"]:
+        lines += ["The longest paragraphs:", ""]
+        lines += [f"{n}. {count} words{', claims ' + ', '.join(ids) if ids else ''}: \"{start}\""
+                  for n, (count, ids, start) in enumerate(found["longest"], 1)]
+        lines.append("")
+    if found["repeated"]:
+        lines += ["Claims that take more than one paragraph (say each once and cut the repeats):", ""]
+        lines += [f"- {claim_id}: {count} paragraphs, {total} words" for claim_id, count, total in found["repeated"]]
+        lines.append("")
+    more = []
+    if claims:
+        per_claim = limit // claims
+        row = f"The claim table has {claims} claims. At {limit} words that is about {per_claim} words per claim"
+        if per_claim < THIN_CLAIM:
+            row += (f", less than one short paragraph each: the writer cannot fit them. Delete or merge claims in "
+                    f"state/claims/{sec_id}.json (then approve and run again), or raise max_words in paper.yaml")
+        more.append(row + ".")
+    if kept:
+        more.append(f"inputs/{sec_id}_draft.md marks about {kept} words as [KEEP]. The writer must keep them word for word"
+                    + (", and that alone is over the limit." if kept > limit else "."))
+    if starting > limit:
+        more.append(f"Your starting draft in inputs/{sec_id}_draft.md has {starting} words, and the writer follows it. "
+                    "Shorten it there, or mark what can go with [CHANGE: shorten].")
+    if found["long_sentences"]:
+        more.append(f"{found['long_sentences']} sentence(s) have more than {LONG_SENTENCE} words: split or trim them.")
+    if found["filler"]:
+        more.append("Filler to delete: " + ", ".join(f'"{phrase}" ({count})' for phrase, count in found["filler"][:6]) + ".")
+    if more:
+        lines += ["Also:", ""] + [f"- {row}" for row in more] + [""]
+    return lines[:-1] if lines[-1] == "" else lines
+'''
+
 FILES['src/paperkit/build.py'] = r'''
 """Build: join the sections, substitute numbers, run pandoc, write the report."""
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
-from . import facts
+from . import facts, shorten
 from .schemas import Issue, PaperSpec
 from .validators.common import COMMENT, MARKER
 
@@ -1320,8 +1460,38 @@ def pandoc(md_path: Path, root: Path, spec: PaperSpec) -> Path | None:
     return out
 
 
+def latest_draft(root: Path, sec_id: str) -> Path | None:
+    """The finished draft of a section, or the draft of its last round if it never finished."""
+    final = root / "drafts" / f"{sec_id}.md"
+    if final.exists():
+        return final
+    rounds = [(int(m.group(1)), f) for f in (root / "drafts").glob(f"{sec_id}.r*.md")
+              if (m := re.fullmatch(rf"{re.escape(sec_id)}\.r(\d+)", f.stem))]
+    return max(rounds)[1] if rounds else None
+
+
+def where_to_shorten(root: Path, spec: PaperSpec) -> list[str]:
+    """Report lines for every section whose latest draft is over its word limit. Counting only, no model."""
+    lines: list[str] = []
+    for sec in spec.sections:
+        path = latest_draft(root, sec.id)
+        found = shorten.analyse(path.read_text(encoding="utf-8"), sec.max_words) if path else None
+        if not found:
+            continue
+        try:
+            table = json.loads((root / "state" / "claims" / f"{sec.id}.json").read_text(encoding="utf-8"))
+            claims = len(table.get("claims") or [])
+        except (OSError, ValueError, AttributeError):
+            claims = 0
+        own = root / "inputs" / f"{sec.id}_draft.md"
+        text = own.read_text(encoding="utf-8") if own.is_file() else ""
+        lines += [""] + shorten.report_lines(sec.id, path.relative_to(root).as_posix(), found, claims,
+                                             shorten.kept_words(text), shorten.own_words(text))
+    return lines
+
+
 def report(root: Path, spec: PaperSpec, status: dict[str, str], issues: list[Issue]) -> Path:
-    """build/report.md: section statuses and everything left open for a person."""
+    """build/report.md: section statuses, everything left open for a person, and where to shorten a long draft."""
     lines = [f"# Report: {spec.title}", "", "## Sections", ""]
     lines += [f"- {sec.id}: {status.get(sec.id, 'NEW')}" for sec in spec.sections]
     lines += ["", "## Open issues", ""]
@@ -1333,6 +1503,7 @@ def report(root: Path, spec: PaperSpec, status: dict[str, str], issues: list[Iss
                 rows.append(f"- [escalated] {sec.id} / {item['gate']}: {item['message']}"
                             + (f" | {item['excerpt']}" if item.get("excerpt") else ""))
     lines += rows or ["- none"]
+    lines += where_to_shorten(root, spec)
     out = root / "build" / "report.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1543,6 +1714,9 @@ def run_section(p: Project, sec_id: str, say=_quiet) -> str:
 
     _dump(reviews / f"{sec_id}.open.json", _rows(issues))   # hand over to a person; never accept silently
     say(f"{sec_id}: {len(issues)} problem(s) left after {rounds} rounds -> state/reviews/{sec_id}.open.json")
+    if any(i.message.startswith("Too long") for i in issues):
+        say("  The draft is over its word limit: the build (menu 7, or `paperkit build`) writes where to "
+            "shorten it into build/report.md")
     return p.set_status(sec_id, "ESCALATED")
 
 
@@ -1866,6 +2040,57 @@ def test_each_stage_is_reported_while_it_runs(project):
     said.clear()
     assert orchestrator.run_section(project, "discussion", said.append) == "ESCALATED"
     assert "no rounds left" in "\n".join(said) and said[-1].endswith("-> state/reviews/discussion.open.json")
+
+
+PAD = " ".join(["word"] * 60)
+TOO_LONG = """## Principal findings
+
+We observed an association between X and Y ({{F1}}) among {{F2}} participants. PAD <!-- C1 -->
+
+We observed it again ({{F1}}) in order to be sure. PAD <!-- C1 -->
+
+## Interpretation
+
+This suggests that X tracks Y, consistent with earlier work [@smith2020]. PAD <!-- C2 -->
+
+This reading assumes that measurement error was unrelated to Y, which we did not test. PAD <!-- C3 -->
+""".replace("PAD", PAD)
+
+
+def test_a_draft_that_is_too_long_gets_targets_and_the_report_says_where_to_shorten(project, tmp_path):
+    prompts = []
+
+    def llm(system, user, schema):
+        if schema is ClaimList:
+            return ClaimList(claims=CLAIMS)
+        prompts.append(user)
+        return Draft(markdown=TOO_LONG)                 # the writer never gets under the limit of 200 words
+
+    agents.LLM = llm
+    orchestrator.plan(project, "discussion")
+    orchestrator.approve(project, "discussion")
+    said = []
+    assert orchestrator.run_section(project, "discussion", said.append) == "ESCALATED"
+    assert "build/report.md" in said[-1]
+
+    again = prompts[1]                                  # round 2: the writer is told how much to cut and where
+    assert "Too long:" in again and "| cut " in again and "aim per heading: Principal findings" in again
+    assert "say each claim once: C1 take more than one paragraph" in again
+
+    (tmp_path / "inputs" / "discussion_draft.md").write_text(
+        "<!-- how to use -->\n\n## Principal findings\n\n" + " ".join(["kept"] * 250) + " [KEEP]\n", encoding="utf-8")
+    text = build.report(tmp_path, project.spec, project.status(), []).read_text(encoding="utf-8")
+    assert "## Where to shorten: discussion" in text and "The latest draft (drafts/discussion.r3.md) has" in text
+    assert "| Heading | Now | Target | Cut |" in text and "| Principal findings | " in text and "| Interpretation | " in text
+    assert "The longest paragraphs:" in text and "- C1: 2 paragraphs, " in text
+    assert "The claim table has 3 claims. At 200 words that is about 66 words per claim, less than one short" in text
+    assert "marks about 250 words as [KEEP]" in text and "that alone is over the limit" in text
+    assert "Your starting draft in inputs/discussion_draft.md has 252 words" in text
+    assert 'Filler to delete: "in order to" (1).' in text
+
+    (tmp_path / "drafts" / "discussion.md").write_text(GOOD, encoding="utf-8")      # a finished draft within the limit
+    text = build.report(tmp_path, project.spec, {"discussion": "DONE"}, []).read_text(encoding="utf-8")
+    assert "Where to shorten" not in text
 
 
 def test_escalates_when_rounds_run_out(project):
@@ -2932,7 +3157,9 @@ MENU = {
     "7": "Build the paper and the report",
     "8": "Show section statuses",
     "9": "Choose the model provider and test the connection",
-    "r": "Writing rules from the guides in .writing_guides  (reading them calls the API)",
+    "f": "Draft facts.csv from the Results section           (calls the API)",
+    "k": "Draft key_messages.md from the Results section     (calls the API)",
+    "r": "Writing rules from the guides in .writing_guides   (reading them calls the API)",
     "q": "Quit",
 }
 
@@ -3456,8 +3683,26 @@ def act_rules(ui: UI, root: Path) -> None:
         rules_ingest.run(root, "list", out=ui.out)
 
 
+def _draft_from_results(ui: UI, root: Path, what: str) -> None:
+    """Menu f and k: the same drafting step that the input checklist offers, reachable at any time."""
+    name = "inputs/facts.csv" if what == "facts" else "inputs/key_messages.md"
+    untouched = extract.facts_are_default(root) if what == "facts" else extract.messages_are_default(root)
+    if not untouched and not ui.confirm(f"{name} already has content and will be replaced. Continue?", False):
+        return
+    draft_with_model(ui, root, what)
+
+
+def act_facts(ui: UI, root: Path) -> None:
+    _draft_from_results(ui, root, "facts")
+
+
+def act_key_messages(ui: UI, root: Path) -> None:
+    _draft_from_results(ui, root, "key-messages")
+
+
 ACTIONS = {"1": act_inputs, "2": act_dry_run, "3": act_plan, "4": act_approve,
-           "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models, "r": act_rules}
+           "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models,
+           "f": act_facts, "k": act_key_messages, "r": act_rules}
 
 
 def menu(ui: UI, root: Path) -> int:
@@ -3897,6 +4142,26 @@ def test_start_screen_offers_to_draft_facts_and_messages(fresh):
     wizard.fill(ui, fresh, checks["key_messages"])
     assert status(fresh)["facts"] is True and status(fresh)["key_messages"] is True
     assert any("a model drafted them" in row for row in printed)
+
+
+def test_menu_drafts_facts_and_key_messages_and_asks_before_replacing(fresh):
+    assert set(wizard.MENU) == set(wizard.ACTIONS) | {"q"}               # every menu line has its action
+    (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
+    agents.LLM = fake_model(facts=["n = 412"], messages=["Y varies by age group."])
+    ui, printed = scripted(["y"])                                        # the files are placeholders: only the API question
+    wizard.ACTIONS["f"](ui, fresh)
+    ui, printed_k = scripted(["y"])
+    wizard.ACTIONS["k"](ui, fresh)
+    assert status(fresh)["facts"] is True and status(fresh)["key_messages"] is True
+    assert any("F1   n = 412" in row for row in printed) and any("Y varies by age group." in row for row in printed_k)
+
+    agents.LLM = fake_model(facts=["r = 0.29"], messages=["X is associated with Y."])
+    ui, printed = scripted(["n"])                                        # real content now: asked first, and "no" keeps it
+    wizard.ACTIONS["f"](ui, fresh)
+    assert "n = 412" in (fresh / "inputs" / "facts.csv").read_text(encoding="utf-8")
+    ui, printed = scripted(["y", "y"])                                   # yes to replacing, yes to the API call
+    wizard.ACTIONS["f"](ui, fresh)
+    assert "r = 0.29" in (fresh / "inputs" / "facts.csv").read_text(encoding="utf-8")
 
 
 DRAFT_EMPTY = "<!--\nHOW TO USE\n[WRITE: an example inside the comment]\n-->\n\n## Principal findings\n\n## Limitations\n"
