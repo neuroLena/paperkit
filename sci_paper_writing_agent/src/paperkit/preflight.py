@@ -207,7 +207,10 @@ def check_inputs(root: str | Path) -> list[Check]:
         found = rules_ingest.state(root)
         detail = ("none" if not found["guides"] and not found["candidates"]
                   else f"{found['guides']} file(s), no rules yet: run `paperkit rules extract`" if not found["candidates"]
-                  else f"{found['guides']} file(s), {found['approved']} of {found['candidates']} rule(s) approved")
+                  else f"{found['guides']} file(s), {found['approved']} of {found['relevant']} rule(s) approved"
+                  + (f", {found['candidates'] - found['relevant']} for other sections"
+                     if found["candidates"] > found["relevant"] else "")
+                  + (f", {found['conflicts']} contradiction(s) to settle" if found["conflicts"] else ""))
         checks.append(Check("guides", ".writing_guides/", "Writing guides", "optional", found["approved"] > 0, detail,
                             "the journal's guide for authors and reporting guidelines, as PDF; then `paperkit rules extract`"))
     for sec_id in _section_ids(root):

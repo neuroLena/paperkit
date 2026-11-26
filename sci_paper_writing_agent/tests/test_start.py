@@ -392,6 +392,31 @@ def test_start_screen_offers_to_draft_facts_and_messages(fresh):
     assert any("a model drafted them" in row for row in printed)
 
 
+def test_a_garbled_or_russian_layout_answer_does_not_stop_the_menu(fresh):
+    from paperkit import keys
+
+    def typed(*answers):
+        feed = iter(answers)
+
+        def ask(prompt=""):
+            item = next(feed)
+            if isinstance(item, bytes):                               # what a half-deleted Cyrillic letter leaves behind
+                item.decode("utf-8")
+            return item
+        return ask
+
+    printed = []
+    ui = wizard.UI(ask=typed(b"\xd0r", "к"), out=printed.append, color=False)
+    assert ui.choose("What next?", {"r": "rules", "q": "quit"}) == "r"         # asked again, then the R key in Russian
+    assert any("could not be read" in row for row in printed)
+    ui = wizard.UI(ask=typed("н", "да", "нет", "т", "", "Y"), out=printed.append, color=False)
+    assert [ui.confirm("Go on?", False) for _ in range(6)] == [True, True, False, False, False, True]
+    assert keys.latin("й") == "q" and keys.latin("r") == "r"
+    ui = wizard.UI(ask=typed(*[b"\xd0"] * 5), out=printed.append, color=False)
+    with pytest.raises(wizard.Quit):                                           # never readable: leave, do not loop
+        ui.ask("> ")
+
+
 def test_menu_drafts_facts_and_key_messages_and_asks_before_replacing(fresh):
     assert set(wizard.MENU) == set(wizard.ACTIONS) | {"q"}               # every menu line has its action
     (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")

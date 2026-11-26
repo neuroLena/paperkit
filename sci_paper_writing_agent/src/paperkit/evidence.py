@@ -24,7 +24,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from . import agents, orchestrator, scholar, zotero
+from . import agents, keys, orchestrator, scholar, zotero
 from .schemas import Claim
 
 KINDS = ("supporting", "contradicting", "alternative")
@@ -389,7 +389,7 @@ def review(root: str | Path, sec_id: str, ask=input, out=print) -> int:
             out(f"{number} of {len(waiting)}, for {finding['claim_id']}: {_line(finding['text'], 110)}")
             for text in show(finding, row):
                 out(text)
-            answer = ask("[y] accept  [n] reject  [l] later  [q] stop > ").strip().lower()[:1]
+            answer = keys.latin(keys.read(ask, "[y] accept  [n] reject  [l] later  [q] stop > ", out).strip().lower())[:1]
             if answer == "q":
                 break
             if answer == "y":

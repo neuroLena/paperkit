@@ -160,6 +160,9 @@ def run_section(p: Project, sec_id: str, say=_quiet) -> str:
     rules = [{"id": r.id, "instruction": r.instruction, "priority": r.priority} for r in ctx.rules]
     if rules:
         say(f"{sec_id}: {len(rules)} approved writing rule(s) apply")
+    for first_id, second_id, _ in rules_ingest.clashes(ctx.rules, approved_only=True):
+        say(f"  warning: writing rules {first_id} and {second_id} contradict each other and both are approved "
+            f"(paperkit rules reject <id> takes one out)")
 
     draft, issues, rounds = "", [], p.spec.max_rounds
     for rnd in range(1, rounds + 1):

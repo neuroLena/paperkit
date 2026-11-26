@@ -71,9 +71,10 @@ def main(argv: list[str] | None = None) -> int:
     ext.add_argument("what", nargs="?", choices=["all", "facts", "key-messages"], default="all")
     ext.add_argument("--force", action="store_true", help="replace the file even if it already has real content")
     rul = sub.add_parser("rules", help="writing guides in .writing_guides/ -> rules for the writer and reviewer")
-    rul.add_argument("action", choices=["extract", "list", "approve", "reject"],
-                     help="extract calls the model; approve with no ids asks about each rule in turn")
-    rul.add_argument("ids", nargs="*", help="rule ids such as R3 R7, for approve and reject")
+    rul.add_argument("action", choices=["extract", "check", "list", "approve", "reject", "restore"],
+                     help="extract and check call the model; check drops repeated rules and flags contradictions; "
+                          "approve with no ids asks about each rule in turn")
+    rul.add_argument("ids", nargs="*", help="rule ids such as R3 R7 (approve, reject, restore)")
     rul.add_argument("--all", action="store_true", help="approve every candidate")
     rul.add_argument("--fresh", action="store_true", help="ask the model again instead of using saved answers")
     evi = sub.add_parser("evidence", help="search the literature for a section's claims: support, contradiction, "
@@ -106,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         for kind in agents.PIPELINE_AGENTS:
             agents.route(kind)
     except (ValueError, OSError) as exc:
-        if (cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action == "extract")
+        if (cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action in ("extract", "check"))
                 or (cmd == "evidence" and args.action == "search")):
             print(f"Model configuration is not valid: {exc}")
             return 2

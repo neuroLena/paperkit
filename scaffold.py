@@ -149,6 +149,7 @@ Put the journal's guide for authors, reporting guidelines and style guides in `.
 
 ```bash
 paperkit rules extract      # reads the guides and proposes rules -> rules/candidates.json (calls the model)
+paperkit rules check        # drops rules that repeat another, flags rules that contradict each other (calls the model)
 paperkit rules approve      # asks about each rule; or: paperkit rules approve R1 R4, or --all
 paperkit rules list         # every rule with its quote and page; paperkit rules reject R4 takes one out
 ```
@@ -1697,6 +1698,9 @@ def run_section(p: Project, sec_id: str, say=_quiet) -> str:
     rules = [{"id": r.id, "instruction": r.instruction, "priority": r.priority} for r in ctx.rules]
     if rules:
         say(f"{sec_id}: {len(rules)} approved writing rule(s) apply")
+    for first_id, second_id, _ in rules_ingest.clashes(ctx.rules, approved_only=True):
+        say(f"  warning: writing rules {first_id} and {second_id} contradict each other and both are approved "
+            f"(paperkit rules reject <id> takes one out)")
 
     draft, issues, rounds = "", [], p.spec.max_rounds
     for rnd in range(1, rounds + 1):
@@ -1971,7 +1975,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from . import agents, orchestrator, scholar, zotero
+from . import agents, keys, orchestrator, scholar, zotero
 from .schemas import Claim
 
 KINDS = ("supporting", "contradicting", "alternative")
@@ -2336,7 +2340,7 @@ def review(root: str | Path, sec_id: str, ask=input, out=print) -> int:
             out(f"{number} of {len(waiting)}, for {finding['claim_id']}: {_line(finding['text'], 110)}")
             for text in show(finding, row):
                 out(text)
-            answer = ask("[y] accept  [n] reject  [l] later  [q] stop > ").strip().lower()[:1]
+            answer = keys.latin(keys.read(ask, "[y] accept  [n] reject  [l] later  [q] stop > ", out).strip().lower())[:1]
             if answer == "q":
                 break
             if answer == "y":
@@ -2647,9 +2651,10 @@ def main(argv: list[str] | None = None) -> int:
     ext.add_argument("what", nargs="?", choices=["all", "facts", "key-messages"], default="all")
     ext.add_argument("--force", action="store_true", help="replace the file even if it already has real content")
     rul = sub.add_parser("rules", help="writing guides in .writing_guides/ -> rules for the writer and reviewer")
-    rul.add_argument("action", choices=["extract", "list", "approve", "reject"],
-                     help="extract calls the model; approve with no ids asks about each rule in turn")
-    rul.add_argument("ids", nargs="*", help="rule ids such as R3 R7, for approve and reject")
+    rul.add_argument("action", choices=["extract", "check", "list", "approve", "reject", "restore"],
+                     help="extract and check call the model; check drops repeated rules and flags contradictions; "
+                          "approve with no ids asks about each rule in turn")
+    rul.add_argument("ids", nargs="*", help="rule ids such as R3 R7 (approve, reject, restore)")
     rul.add_argument("--all", action="store_true", help="approve every candidate")
     rul.add_argument("--fresh", action="store_true", help="ask the model again instead of using saved answers")
     evi = sub.add_parser("evidence", help="search the literature for a section's claims: support, contradiction, "
@@ -2682,7 +2687,7 @@ def main(argv: list[str] | None = None) -> int:
         for kind in agents.PIPELINE_AGENTS:
             agents.route(kind)
     except (ValueError, OSError) as exc:
-        if (cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action == "extract")
+        if (cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action in ("extract", "check"))
                 or (cmd == "evidence" and args.action == "search")):
             print(f"Model configuration is not valid: {exc}")
             return 2
@@ -3004,6 +3009,10 @@ The model proposes; code verifies; a person approves:
 - kept rules go to rules/candidates.json with approved set to false. Only approved rules, which are copied to
   rules/active_rules.json, ever reach the writer, the reviewer and the gate;
 - every answered part is saved in .cache/guides/, so a run that failed half way continues where it stopped.
+
+`check` is a separate step for after the guides are read. It drops rules that repeat another rule and marks
+rules that contradict each other. Nothing is deleted: a dropped rule stays in rules/candidates.json with a note
+of the rule it repeats, and `restore` brings it back.
 """
 from __future__ import annotations
 
@@ -3017,7 +3026,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
-from .. import agents
+from .. import agents, keys
 from ..ingestion_schemas import WritingRule
 
 GUIDES = ".writing_guides"
@@ -3026,6 +3035,9 @@ CATEGORIES = ("structure", "argumentation", "language", "statistics", "reporting
               "scientific_reasoning")
 PRIORITIES = ("required", "recommended", "optional")
 MIN_QUOTE_WORDS = 3
+KEPT_BY_HAND = "none"           # duplicate_of of a rule a person restored: it is never dropped again
+STRENGTH = {"required": 0, "recommended": 1, "optional": 2}
+AUTHORITY = {"journal": 0, "reporting": 1, "general": 2}       # whose wording is kept when two guides say the same
 NONE_YET = f"No rules yet. Put the guides in {GUIDES}/ and run: paperkit rules extract"
 
 PROMPT = """You read part of a writing guide (a journal's instructions for authors, a reporting guideline or a style guide) and list the rules that say how the TEXT of a scientific paper must be written. You write no prose.
@@ -3053,6 +3065,32 @@ class ProposedRule(BaseModel):
 
 class RuleList(BaseModel):
     rules: list[ProposedRule] = Field(default_factory=list)
+
+
+COMPARE = """You compare writing rules that were taken from several guides. You change no rule and you write no new one.
+
+Each line of <rules> is: id [sections; priority; kind of guide] instruction.
+
+Return:
+- repeats: groups of rule ids that ask for the same thing, so that a text that follows one of them follows the others too. The same requirement in other words is a repeat. A stricter, narrower or more detailed version is NOT a repeat: leave it out. Put an id in one group at most.
+- contradictions: pairs of rule ids that cannot both be followed in the same section, each with a one-sentence reason. Examples: two different word limits for the same section; one rule requires what the other forbids. Rules for different sections do not contradict each other. A general rule and a stricter rule on the same point do not contradict each other.
+
+If there are none, return empty lists. Use only ids that are in <rules>."""
+
+
+class Repeat(BaseModel):
+    ids: list[str] = Field(description="Ids of rules that ask for the same thing")
+
+
+class Clash(BaseModel):
+    first: str = Field(description="A rule id")
+    second: str = Field(description="The id of the rule it contradicts")
+    reason: str = Field(default="", description="One sentence: why both cannot be followed")
+
+
+class RuleCheck(BaseModel):
+    repeats: list[Repeat] = Field(default_factory=list)
+    contradictions: list[Clash] = Field(default_factory=list)
 
 
 # ------------------------------------------------------------------ reading
@@ -3155,12 +3193,52 @@ def for_section(root: str | Path, sec_id: str, title: str = "") -> list[WritingR
     return [r for r in load(root, "active_rules") if r.approved and names & {s.lower() for s in r.sections}]
 
 
+def dropped(rule: WritingRule) -> bool:
+    """True for a rule that `check` set aside because it repeats another rule."""
+    return rule.duplicate_of not in ("", KEPT_BY_HAND)
+
+
+def paper_sections(root: str | Path) -> set[str]:
+    """The names a rule can use for a section of this paper: the ids and titles in paper.yaml, and "all"."""
+    names = {"all"}
+    try:
+        raw = yaml.safe_load((Path(root) / "paper.yaml").read_text(encoding="utf-8")) or {}
+        for sec in raw.get("sections", []):
+            if isinstance(sec, dict):
+                names |= {str(sec[k]).lower() for k in ("id", "title") if sec.get(k)}
+    except Exception:
+        pass
+    return names
+
+
+def relevant(rule: WritingRule, names: set[str]) -> bool:
+    """True if the rule can apply to a section this paper has. Guides are full of rules for other sections
+    (abstract, methods, references ...): those are kept but not compared, and you are not asked about them."""
+    return len(names) == 1 or bool(names & {s.lower() for s in rule.sections})
+
+
+def _number(rule: WritingRule) -> int:
+    found = re.fullmatch(r"R(\d+)", rule.id)
+    return int(found.group(1)) if found else 10 ** 9
+
+
+def clashes(rules: list[WritingRule], approved_only: bool = False) -> list[tuple[str, str, str]]:
+    """(id, id, reason) for every pair of rules marked as contradicting. With approved_only: both are in use."""
+    live = {r.id: r for r in rules if not dropped(r) and (r.approved or not approved_only)}
+    return [(r.id, other, reason) for r in sorted(live.values(), key=_number) for other, reason in r.conflicts.items()
+            if other in live and _number(r) < _number(live[other])]
+
+
 def state(root: str | Path) -> dict:
     try:
         rules = load(root)
     except ValueError:
         rules = []
-    return {"guides": len(guide_files(root)), "candidates": len(rules), "approved": sum(r.approved for r in rules)}
+    names = paper_sections(root)
+    live = [r for r in rules if not dropped(r)]
+    ours = [r for r in live if relevant(r, names)]
+    return {"guides": len(guide_files(root)), "candidates": len(live), "relevant": len(ours),
+            "approved": sum(r.approved for r in ours), "dropped": len(rules) - len(live), "conflicts": len(clashes(rules))}
 
 
 # ------------------------------------------------------------------ checking a proposal
@@ -3319,6 +3397,148 @@ def extract(root: str | Path, fresh: bool = False, say=lambda text: None) -> dic
     return {"files": len(files), "rules": final, "new": new, "dropped": dropped, "failed": failed}
 
 
+# ------------------------------------------------------------------ repeats and contradictions
+
+def _overlap(first: WritingRule, second: WritingRule) -> bool:
+    """True if both rules can apply to the same section. Rules for different sections neither repeat nor contradict."""
+    one, two = {s.lower() for s in first.sections}, {s.lower() for s in second.sections}
+    return "all" in one or "all" in two or bool(one & two)
+
+
+def check(root: str | Path, fresh: bool = False, say=lambda text: None) -> dict:
+    """Drops rules that repeat another rule and marks rules that contradict each other. Run it after `extract`.
+
+    Only rules for the sections this paper has are compared. Word-for-word repeats are found by code. Repeats in
+    other words and contradictions are proposed by the model, one category of rules at a time, and code accepts
+    them only between rules it showed the model that can apply to the same section. Of a group of repeats one
+    rule is kept: an approved one first, then the journal's guide before a reporting guideline before a general
+    style guide. It takes over the widest scope and the strictest priority of the group.
+    """
+    root = Path(root)
+    rules = load(root)
+    names = paper_sections(root)
+    live = [r for r in rules if not dropped(r)]
+    compared = [r for r in live if relevant(r, names)]
+    if len(compared) < 2:
+        raise ValueError("There are fewer than two rules for this paper's sections to compare. "
+                         "Read the guides first: paperkit rules extract")
+    for rule in rules:
+        rule.conflicts = {}                    # worked out again from scratch every time
+    everyone = {r.id.upper(): r for r in rules}
+
+    groups: list[list[WritingRule]] = []
+    word_for_word: dict[str, list[WritingRule]] = {}
+    for rule in compared:
+        word_for_word.setdefault(_key(rule.instruction), []).append(rule)
+    groups += [group for group in word_for_word.values() if len(group) > 1]
+
+    # the model sees one category at a time, at most PAPERKIT_CHECK_RULES rules per request
+    limit = max(2, int(os.environ.get("PAPERKIT_CHECK_RULES") or "80"))
+    by_category: dict[str, list[WritingRule]] = {}
+    for rule in compared:
+        by_category.setdefault(rule.category, []).append(rule)
+    batches: list[tuple[str, list[WritingRule]]] = []
+    for category in sorted(by_category):
+        rows = sorted(by_category[category], key=lambda r: (sorted(x.lower() for x in r.sections), _number(r)))
+        batches += [(category, rows[i:i + limit]) for i in range(0, len(rows), limit) if len(rows[i:i + limit]) > 1]
+
+    agents.LOG_DIR = root / "state" / "log"
+    answers: list[tuple[list[WritingRule], RuleCheck]] = []
+    failed: list[str] = []
+    for number, (category, part) in enumerate(batches, 1):
+        listing = "\n".join(f"{r.id} [{', '.join(r.sections)}; {r.priority}; {r.group or 'general'}] {r.instruction}"
+                            for r in part)
+        digest = hashlib.sha256(json.dumps([COMPARE, listing]).encode("utf-8")).hexdigest()[:24]
+        cache = root / ".cache" / "guides" / f"check-{digest}.json"
+        where = f"rules: {category} rules, group {number} of {len(batches)} ({len(part)} rules)"
+        answer = None
+        if cache.is_file() and not fresh:
+            try:
+                answer = RuleCheck.model_validate_json(cache.read_text(encoding="utf-8"))
+                say(f"{where}: answer kept from an earlier run")
+            except ValueError:
+                answer = None
+        if answer is None:
+            say(f"{where}: asking the model ...")
+            try:
+                answer = agents._ask("rules", COMPARE, agents._tag("rules", listing), RuleCheck)
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(answer.model_dump_json(), encoding="utf-8")
+            except Exception as exc:           # a provider error: the other groups still count
+                failed.append(f"{category} rules: {type(exc).__name__}: {_short(exc)}")
+                continue
+        answers.append((part, answer))
+
+    grouped = {id(r) for group in groups for r in group}
+    for part, answer in answers:
+        shown = {r.id.upper(): r for r in part}
+        for repeat in answer.repeats:
+            members: list[WritingRule] = []
+            for raw in repeat.ids:
+                rule = shown.get(str(raw).strip().upper())
+                if (rule is not None and id(rule) not in grouped and rule not in members
+                        and all(_overlap(rule, other) for other in members)):
+                    members.append(rule)
+            if len(members) > 1:
+                groups.append(members)
+                grouped |= {id(r) for r in members}
+
+    removed: list[tuple[WritingRule, WritingRule]] = []
+    for group in groups:
+        group = [r for r in group if r.duplicate_of != KEPT_BY_HAND]         # a person kept these: never dropped
+        if len(group) < 2:
+            continue
+        kept = min(group, key=lambda r: (not r.approved, AUTHORITY.get(r.group, 3), STRENGTH.get(r.priority, 3), _number(r)))
+        sections = list(dict.fromkeys(x for r in group for x in r.sections))
+        kept.sections = ["all"] if "all" in [x.lower() for x in sections] else sections
+        kept.priority = min((r.priority for r in group), key=lambda name: STRENGTH.get(name, 3))
+        kept.severity = "blocking" if kept.priority == "required" else kept.severity
+        for rule in group:
+            if rule is kept:
+                continue
+            kept.avoid_terms += [t for t in rule.avoid_terms if t.lower() not in [k.lower() for k in kept.avoid_terms]]
+            rule.duplicate_of, rule.approved = kept.id, False
+            removed.append((kept, rule))
+        if kept.avoid_terms:
+            kept.validation_method = "python"
+
+    found: list[tuple[WritingRule, WritingRule, str]] = []
+    for part, answer in answers:
+        shown = {r.id.upper(): r for r in part}
+        for clash in answer.contradictions:
+            pair = []
+            for raw in (clash.first, clash.second):
+                rule = shown.get(str(raw).strip().upper())
+                if rule is not None and dropped(rule):     # it was dropped: the rule it repeats stands in for it
+                    rule = everyone.get(rule.duplicate_of.upper())
+                pair.append(rule)
+            first, second = pair
+            if first is None or second is None or first is second or dropped(first) or dropped(second):
+                continue
+            if not _overlap(first, second) or second.id in first.conflicts:
+                continue
+            reason = _short(clash.reason) or "They cannot both be followed."
+            first.conflicts[second.id] = second.conflicts[first.id] = reason
+            found.append((first, second, reason) if _number(first) < _number(second) else (second, first, reason))
+    save(root, rules)
+    return {"checked": len(compared), "others": len(live) - len(compared), "dropped": removed, "clashes": found,
+            "failed": failed}
+
+
+def restore(root: str | Path, ids) -> list[WritingRule]:
+    """Brings back rules that `check` dropped. They become candidates again and are never dropped a second time."""
+    rules = load(root)
+    wanted = {str(i).upper() for i in ids}
+    unknown = sorted(wanted - {r.id.upper() for r in rules})
+    if unknown:
+        raise ValueError(f"No such rule: {', '.join(unknown)}. `paperkit rules list` shows the ids.")
+    back = [r for r in rules if r.id.upper() in wanted and dropped(r)]
+    for rule in back:
+        rule.duplicate_of = KEPT_BY_HAND
+    save(root, rules)
+    return back
+
+
 # ------------------------------------------------------------------ approval
 
 def set_approved(root: str | Path, ids, value: bool) -> list[WritingRule]:
@@ -3327,6 +3547,10 @@ def set_approved(root: str | Path, ids, value: bool) -> list[WritingRule]:
     unknown = sorted(wanted - {r.id.upper() for r in rules})
     if unknown:
         raise ValueError(f"No such rule: {', '.join(unknown)}. `paperkit rules list` shows the ids.")
+    gone = [r for r in rules if value and r.id.upper() in wanted and dropped(r)]
+    if gone:
+        raise ValueError(f"{gone[0].id} was dropped because it repeats {gone[0].duplicate_of}. "
+                         f"To use it after all: paperkit rules restore {gone[0].id}")
     for rule in rules:
         if rule.id.upper() in wanted:
             rule.approved = value
@@ -3336,17 +3560,28 @@ def set_approved(root: str | Path, ids, value: bool) -> list[WritingRule]:
 
 def show(rule: WritingRule) -> list[str]:
     where = rule.source_file + (f", p. {rule.source_page}" if rule.source_page else "")
-    rows = [f"[{'x' if rule.approved else ' '}] {rule.id}  {rule.priority}, {', '.join(rule.sections)}: {rule.instruction}",
+    mark = "=" if dropped(rule) else "x" if rule.approved else " "
+    rows = [f"[{mark}] {rule.id}  {rule.priority}, {', '.join(rule.sections)}: {rule.instruction}",
             f'      "{_short(rule.source_quote or "", 220)}"  ({where})']
     if rule.avoid_terms:
         rows.append(f"      code will flag: {', '.join(rule.avoid_terms)}")
+    if dropped(rule):
+        rows.append(f"      dropped: it repeats {rule.duplicate_of} (to use it after all: paperkit rules restore {rule.id})")
+    for other, reason in rule.conflicts.items():
+        rows.append(f"      CONTRADICTS {other}: {reason}")
     return rows
 
 
 def review(root: str | Path, ask=input, out=print) -> int:
     """Walks through the candidates that are not approved yet. Returns how many were approved."""
     rules = load(root)
-    waiting = [r for r in rules if not r.approved]
+    names = paper_sections(root)
+    waiting = [r for r in rules if not r.approved and not dropped(r) and relevant(r, names)]
+    elsewhere = [r for r in rules if not r.approved and not dropped(r) and not relevant(r, names)]
+    if elsewhere:
+        other = sorted({x.lower() for r in elsewhere for x in r.sections})
+        out(f"{len(elsewhere)} rule(s) are for sections that paper.yaml does not have ({', '.join(other[:8])}"
+            f"{', ...' if len(other) > 8 else ''}): you are not asked about them. `paperkit rules list` shows them.")
     count = 0
     try:
         for number, rule in enumerate(waiting, 1):
@@ -3354,7 +3589,8 @@ def review(root: str | Path, ask=input, out=print) -> int:
             out(f"Rule {number} of {len(waiting)}")
             for row in show(rule):
                 out(row)
-            answer = ask("[y] approve  [n] leave out  [a] approve this and all the rest  [q] stop > ").strip().lower()[:1]
+            answer = keys.latin(keys.read(
+                ask, "[y] approve  [n] leave out  [a] approve this and all the rest  [q] stop > ", out).strip().lower())[:1]
             if answer == "a":
                 for rest in waiting[number - 1:]:
                     rest.approved = True
@@ -3376,7 +3612,7 @@ def review(root: str | Path, ask=input, out=print) -> int:
 
 def run(root: str | Path, action: str = "list", ids=(), everything: bool = False, fresh: bool = False,
         out=print, ask=input) -> int:
-    """extract | list | approve | reject. Exit code 1 if something failed."""
+    """extract | check | list | approve | reject | restore. Exit code 1 if something failed."""
     root = Path(root)
     try:
         if action == "extract":
@@ -3392,9 +3628,41 @@ def run(root: str | Path, action: str = "list", ids=(), everything: bool = False
                 out(f"  failed: {row}")
             if got["failed"]:
                 out("Run it again for what failed: finished parts are kept and are not asked again.")
+            if len(got["rules"]) > 1:
+                out("Next, drop repeated rules and find contradictions: paperkit rules check")
             if len(got["rules"]) > approved:
                 out("Nothing is used until you approve it: paperkit rules approve")
             return 1 if got["failed"] else 0
+
+        if action == "check":
+            got = check(root, fresh, out)
+            out(f"rules: {got['checked']} rule(s) compared."
+                + (f" {got['others']} more are for sections that paper.yaml does not have: they were left alone."
+                   if got["others"] else ""))
+            out(f"Repeats dropped: {len(got['dropped'])}")
+            for kept in dict.fromkeys(k.id for k, _ in got["dropped"]):
+                first = next(k for k, _ in got["dropped"] if k.id == kept)
+                out(f"  {first.id} kept ({first.source_file}, {first.priority}, {', '.join(first.sections)}): {first.instruction}")
+                for _, gone in [pair for pair in got["dropped"] if pair[0].id == kept]:
+                    out(f"      dropped {gone.id} ({gone.source_file}): {gone.instruction}")
+            if got["dropped"]:
+                out("  A dropped rule stays in rules/candidates.json. To use one after all: paperkit rules restore <id>")
+            out(f"Contradictions: {len(got['clashes'])}" + ("   <- settle these" if got["clashes"] else ""))
+            for first, second, reason in got["clashes"]:
+                for rule in (first, second):
+                    where = rule.source_file + (f", p. {rule.source_page}" if rule.source_page else "")
+                    out(f"  {rule.id} ({where}, {rule.priority}{', approved' if rule.approved else ''}): {rule.instruction}")
+                out(f"      why: {reason}")
+            if got["clashes"]:
+                out("  Use one rule of each pair. Take the other out with: paperkit rules reject <id>")
+            for row in got["failed"]:
+                out(f"  failed: {row}")
+            if got["failed"]:
+                out("  Those rules were only checked for word-for-word repeats. Run it again: finished groups are kept.")
+            in_use = clashes(load(root), approved_only=True)
+            for first_id, second_id, _ in in_use:
+                out(f"WARNING: {first_id} and {second_id} contradict each other and both are approved.")
+            return 1 if got["failed"] or in_use else 0
 
         rules = load(root)
         if action == "list":
@@ -3404,27 +3672,41 @@ def run(root: str | Path, action: str = "list", ids=(), everything: bool = False
             for rule in rules:
                 for row in show(rule):
                     out(row)
-            out(f"{sum(r.approved for r in rules)} of {len(rules)} approved. Approved rules are in rules/active_rules.json.")
+            live = [r for r in rules if not dropped(r)]
+            out(f"{sum(r.approved for r in live)} of {len(live)} approved. Approved rules are in rules/active_rules.json."
+                + (f" {len(rules) - len(live)} dropped as repeats [=]." if len(rules) > len(live) else "")
+                + (f" {len(clashes(rules))} contradiction(s) to settle." if clashes(rules) else ""))
             return 0
         if not rules:
             out(NONE_YET)
             return 1
+        if action == "restore":
+            if not ids:
+                out("Name the dropped rules to bring back, for example: paperkit rules restore R7")
+                return 1
+            back = restore(root, ids)
+            out(f"{len(back)} rule(s) brought back as candidates" + (f": {', '.join(r.id for r in back)}." if back else "."))
+            return 0
         if action == "reject":
             if not ids:
                 out("Name the rules to take out, for example: paperkit rules reject R3 R7")
                 return 1
             out(f"{len(set_approved(root, ids, False))} rule(s) taken out.")
         elif everything:
-            for rule in rules:
+            live = [r for r in rules if not dropped(r)]
+            for rule in live:
                 rule.approved = True
             save(root, rules)
-            out(f"All {len(rules)} rule(s) approved.")
+            out(f"All {len(live)} rule(s) approved.")
         elif ids:
             out(f"{len(set_approved(root, ids, True))} rule(s) approved.")
         else:
             out(f"{review(root, ask, out)} rule(s) approved.")
         active = len(load(root, "active_rules"))
         out(f"{active} rule(s) in rules/active_rules.json: the writer and reviewer get the ones for their section.")
+        for first_id, second_id, reason in clashes(load(root), approved_only=True):
+            out(f"WARNING: {first_id} and {second_id} contradict each other and both are approved: {reason} "
+                f"Take one of them out: paperkit rules reject <id>")
         return 0
     except (ValueError, RuntimeError, OSError) as exc:
         out(f"rules: {type(exc).__name__}: {_short(exc, 300)}")
@@ -3461,7 +3743,7 @@ def check(draft: str, ctx: GateContext) -> list[Issue]:
     return issues
 '''
 
-FILES['src/paperkit/ingestion_schemas.py'] = '\n"""Additional schemas for ingestion. Not yet connected to the original pipeline."""\nfrom typing import Literal\nfrom pydantic import BaseModel, Field\nfrom decimal import Decimal\n\n\nclass ScientificFact(BaseModel):\n    id: str\n    text: str\n    analysis: str | None = None\n    outcome: str | None = None\n    predictor: str | None = None\n    modality: str | None = None\n    model: str | None = None\n    sample: str | None = None\n    fold: str | None = None\n    metric: str\n    value: Decimal\n    ci_lower: Decimal | None = None\n    ci_upper: Decimal | None = None\n    confidence_level: Decimal | None = None\n    n: int | None = None\n    unit: str | None = None\n    source_file: str\n    source_row: int | None = None\n    source_column: str | None = None\n    source_sha256: str | None = None\n    approved: bool = False\n\n\nclass MetricSpec(BaseModel):\n    column: str\n    meaning: str\n    unit: str | None = None\n\n\nclass TableSpec(BaseModel):\n    id: str\n    file: str\n    title: str\n    analysis: str\n    grouping_columns: list[str] = Field(default_factory=list)\n    metrics: list[MetricSpec] = Field(default_factory=list)\n\n\nclass TableManifest(BaseModel):\n    tables: list[TableSpec] = Field(default_factory=list)\n\n\nclass SourceDocument(BaseModel):\n    path: str\n    sha256: str\n    citation_key: str | None = None\n    doi: str | None = None\n\n\nclass EvidenceItem(BaseModel):\n    id: str\n    citation_key: str\n    statement: str\n    quotation: str\n    page: int | None = None\n    section: str | None = None\n    verified: bool = False\n\n\nclass LiteratureRecord(BaseModel):\n    source: SourceDocument\n    question: str = ""\n    study_design: str = ""\n    population: str = ""\n    methods: str = ""\n    limitations: list[str] = Field(default_factory=list)\n    evidence: list[EvidenceItem] = Field(default_factory=list)\n\n\nclass ConceptRecord(BaseModel):\n    name: str\n    synthesis: str\n    supporting_evidence_ids: list[str] = Field(default_factory=list)\n    contradicting_evidence_ids: list[str] = Field(default_factory=list)\n    unresolved_questions: list[str] = Field(default_factory=list)\n\n\nclass WritingRule(BaseModel):\n    id: str\n    category: Literal["structure", "argumentation", "language", "statistics", "reporting", "citations", "formatting", "scientific_reasoning"]\n    instruction: str\n    rationale: str = ""\n    sections: list[str] = Field(default_factory=lambda: ["all"])\n    study_designs: list[str] = Field(default_factory=lambda: ["all"])\n    priority: Literal["required", "recommended", "optional"]\n    severity: Literal["blocking", "warning"]\n    validation_method: Literal["python", "ai", "human", "hybrid"]\n    source_file: str\n    source_page: int | None = None\n    source_quote: str | None = None\n    group: str = ""\n    avoid_terms: list[str] = Field(default_factory=list)\n    approved: bool = False\n\n\nclass RuleSet(BaseModel):\n    name: str\n    version: str = "1.0"\n    rules: list[WritingRule] = Field(default_factory=list)\n\n\nclass AgentConfig(BaseModel):\n    provider: str = "anthropic"\n    model: str | None = None\n    max_tokens: int = 8000\n\n\nclass AgentRun(BaseModel):\n    agent: str\n    model: str\n    status: str\n    input_tokens: int | None = None\n    output_tokens: int | None = None\n'
+FILES['src/paperkit/ingestion_schemas.py'] = '\n"""Additional schemas for ingestion. Not yet connected to the original pipeline."""\nfrom typing import Literal\nfrom pydantic import BaseModel, Field\nfrom decimal import Decimal\n\n\nclass ScientificFact(BaseModel):\n    id: str\n    text: str\n    analysis: str | None = None\n    outcome: str | None = None\n    predictor: str | None = None\n    modality: str | None = None\n    model: str | None = None\n    sample: str | None = None\n    fold: str | None = None\n    metric: str\n    value: Decimal\n    ci_lower: Decimal | None = None\n    ci_upper: Decimal | None = None\n    confidence_level: Decimal | None = None\n    n: int | None = None\n    unit: str | None = None\n    source_file: str\n    source_row: int | None = None\n    source_column: str | None = None\n    source_sha256: str | None = None\n    approved: bool = False\n\n\nclass MetricSpec(BaseModel):\n    column: str\n    meaning: str\n    unit: str | None = None\n\n\nclass TableSpec(BaseModel):\n    id: str\n    file: str\n    title: str\n    analysis: str\n    grouping_columns: list[str] = Field(default_factory=list)\n    metrics: list[MetricSpec] = Field(default_factory=list)\n\n\nclass TableManifest(BaseModel):\n    tables: list[TableSpec] = Field(default_factory=list)\n\n\nclass SourceDocument(BaseModel):\n    path: str\n    sha256: str\n    citation_key: str | None = None\n    doi: str | None = None\n\n\nclass EvidenceItem(BaseModel):\n    id: str\n    citation_key: str\n    statement: str\n    quotation: str\n    page: int | None = None\n    section: str | None = None\n    verified: bool = False\n\n\nclass LiteratureRecord(BaseModel):\n    source: SourceDocument\n    question: str = ""\n    study_design: str = ""\n    population: str = ""\n    methods: str = ""\n    limitations: list[str] = Field(default_factory=list)\n    evidence: list[EvidenceItem] = Field(default_factory=list)\n\n\nclass ConceptRecord(BaseModel):\n    name: str\n    synthesis: str\n    supporting_evidence_ids: list[str] = Field(default_factory=list)\n    contradicting_evidence_ids: list[str] = Field(default_factory=list)\n    unresolved_questions: list[str] = Field(default_factory=list)\n\n\nclass WritingRule(BaseModel):\n    id: str\n    category: Literal["structure", "argumentation", "language", "statistics", "reporting", "citations", "formatting", "scientific_reasoning"]\n    instruction: str\n    rationale: str = ""\n    sections: list[str] = Field(default_factory=lambda: ["all"])\n    study_designs: list[str] = Field(default_factory=lambda: ["all"])\n    priority: Literal["required", "recommended", "optional"]\n    severity: Literal["blocking", "warning"]\n    validation_method: Literal["python", "ai", "human", "hybrid"]\n    source_file: str\n    source_page: int | None = None\n    source_quote: str | None = None\n    group: str = ""\n    avoid_terms: list[str] = Field(default_factory=list)\n    duplicate_of: str = ""\n    conflicts: dict[str, str] = Field(default_factory=dict)\n    approved: bool = False\n\n\nclass RuleSet(BaseModel):\n    name: str\n    version: str = "1.0"\n    rules: list[WritingRule] = Field(default_factory=list)\n\n\nclass AgentConfig(BaseModel):\n    provider: str = "anthropic"\n    model: str | None = None\n    max_tokens: int = 8000\n\n\nclass AgentRun(BaseModel):\n    agent: str\n    model: str\n    status: str\n    input_tokens: int | None = None\n    output_tokens: int | None = None\n'
 FILES['docs/ingestion.md'] = '\n# Extended ingestion layout\n\nPlace literature PDFs in `.papers/` and writing guides in `.writing_guides/`.\nUse CSV/TSV tables in `inputs/tables/` and describe them in `manifest.yaml`.\nThe new schemas live in `ingestion_schemas.py`; the existing schemas.py re-exports them for fresh projects.\nExisting projects can import directly from ingestion_schemas without modifying schemas.py.\nCandidate facts go in facts/candidates.json; the original facts/facts.json and inputs/facts.csv remain compatible with the existing CLI.\nThe new registries are templates, not automatically populated. The PDF and table readers are basic utilities; agent ingestion, approvals, configuration loading and new CLI commands are not implemented, with one exception: writing guides are read by `paperkit rules extract` (see the README).\nThe original wiki reads wiki/<citation-key>.md; wiki/sources and wiki/concepts are reserved for future migration.\nInstall PDF parsing support with python -m pip install pymupdf.\n'
 
 FILES['src/paperkit/schemas.py'] += "\n# Extended ingestion schemas\nfrom .ingestion_schemas import (ScientificFact, MetricSpec, TableSpec, TableManifest, SourceDocument, EvidenceItem, LiteratureRecord, ConceptRecord, WritingRule, RuleSet, AgentConfig, AgentRun)\n"
@@ -3474,6 +3756,38 @@ FILES['README.md'] += "\n## Extended ingestion layout\n\nSee [docs/ingestion.md]
 # ----------------------------------------------------------------------------
 # src/paperkit/env.py
 # ----------------------------------------------------------------------------
+FILES['src/paperkit/keys.py'] = r'''
+"""Answers typed at a prompt, whatever the keyboard layout, and without crashing on bytes the terminal garbled."""
+from __future__ import annotations
+
+RUSSIAN = str.maketrans("йцукенгшщзфывапролдячсмить", "qwertyuiopasdfghjklzxcvbnm")
+YES = ("н", "д", "да")          # "н" is the Y key on the Russian layout; "да" is yes
+
+
+def latin(answer: str) -> str:
+    """The same keys read as Latin letters, so a menu letter typed on the Russian layout still works."""
+    return answer.translate(RUSSIAN)
+
+
+def is_yes(answer: str) -> bool:
+    answer = answer.strip().lower()
+    return answer.startswith("y") or answer in YES
+
+
+def read(ask, prompt: str, out=print, tries: int = 5) -> str:
+    """One answer from `ask`. If the terminal hands over bytes that are not text, the question is asked again.
+
+    That happens when a non-Latin letter is typed and then deleted: the terminal removes only half of the
+    letter, and the half that is left cannot be read as text.
+    """
+    for _ in range(tries):
+        try:
+            return ask(prompt)
+        except UnicodeDecodeError:
+            out("That could not be read: a deleted non-Latin letter left a stray byte behind. Please type it again.")
+    raise EOFError("no readable answer")
+'''
+
 FILES['src/paperkit/env.py'] = r'''
 """The shared .env file: one file for every key, in the repository folder (the folder above the project).
 
@@ -3756,7 +4070,10 @@ def check_inputs(root: str | Path) -> list[Check]:
         found = rules_ingest.state(root)
         detail = ("none" if not found["guides"] and not found["candidates"]
                   else f"{found['guides']} file(s), no rules yet: run `paperkit rules extract`" if not found["candidates"]
-                  else f"{found['guides']} file(s), {found['approved']} of {found['candidates']} rule(s) approved")
+                  else f"{found['guides']} file(s), {found['approved']} of {found['relevant']} rule(s) approved"
+                  + (f", {found['candidates'] - found['relevant']} for other sections"
+                     if found["candidates"] > found["relevant"] else "")
+                  + (f", {found['conflicts']} contradiction(s) to settle" if found["conflicts"] else ""))
         checks.append(Check("guides", ".writing_guides/", "Writing guides", "optional", found["approved"] > 0, detail,
                             "the journal's guide for authors and reporting guidelines, as PDF; then `paperkit rules extract`"))
     for sec_id in _section_ids(root):
@@ -3983,7 +4300,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, evidence, extract, facts, orchestrator, preflight, zotero
+from . import agents, build, dryrun, env, evidence, extract, facts, keys, orchestrator, preflight, zotero
 from .ingestion import rules_ingest
 from .schemas import ClaimTable, Issue
 from .validators import blocking
@@ -4009,7 +4326,7 @@ MENU = {
     "9": "Choose the model provider and test the connection",
     "f": "Draft facts.csv from the Results section           (calls the API)",
     "k": "Draft key_messages.md from the Results section     (calls the API)",
-    "r": "Writing rules from the guides in .writing_guides   (reading them calls the API)",
+    "r": "Writing rules: read the guides, check, approve     (reading and checking call the API)",
     "e": "Search the literature for a section's claims       (calls the API and Semantic Scholar)",
     "q": "Quit",
 }
@@ -4039,7 +4356,7 @@ class UI:
 
     def ask(self, prompt: str, strip: bool = True) -> str:
         try:
-            answer = self._ask(prompt)
+            answer = keys.read(self._ask, prompt, self.out)       # a garbled answer is asked for again
         except (EOFError, KeyboardInterrupt, StopIteration):
             raise Quit from None
         return answer.strip() if strip else answer.rstrip("\r\n")
@@ -4049,7 +4366,7 @@ class UI:
 
     def confirm(self, prompt: str, default: bool = True) -> bool:
         answer = self.ask(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").lower()
-        return default if not answer else answer.startswith("y")
+        return default if not answer else keys.is_yes(answer)
 
     def choose(self, prompt: str, options: dict[str, str], default: str = "") -> str:
         self.out(prompt)
@@ -4057,6 +4374,8 @@ class UI:
             self.out(f"  [{key}] {label}")
         while True:
             answer = self.ask(f"> [{default}] " if default else "> ").lower() or default
+            if answer not in options and keys.latin(answer) in options:
+                answer = keys.latin(answer)                        # the right key on the Russian layout
             if answer in options:
                 return answer
             self.out(f"Type one of: {', '.join(options)}")
@@ -4073,7 +4392,7 @@ class UI:
 
     def secret(self, prompt: str) -> str:
         try:
-            return self._secret(prompt).strip()
+            return keys.read(self._secret, prompt, self.out).strip()
         except (EOFError, KeyboardInterrupt, StopIteration):
             raise Quit from None
 
@@ -4522,13 +4841,17 @@ def act_models(ui: UI, root: Path) -> None:
 
 def act_rules(ui: UI, root: Path) -> None:
     found = rules_ingest.state(root)
-    ui.out(f"{found['guides']} guide file(s) in {rules_ingest.GUIDES}/, {found['candidates']} candidate rule(s), "
-           f"{found['approved']} approved.")
+    ui.out(f"{found['guides']} guide file(s) in {rules_ingest.GUIDES}/. {found['relevant']} rule(s) for this paper's "
+           f"sections ({found['candidates'] - found['relevant']} more for other sections): {found['approved']} approved, "
+           f"{found['dropped']} dropped as repeats, {found['conflicts']} contradiction(s) to settle.")
     choice = ui.choose("What now?", {"x": "read the guides and propose rules (calls the API)",
+                                     "c": "check the rules: drop repeats, flag contradictions (calls the API)",
                                      "a": "go through the rules that are not approved yet",
                                      "l": "list all rules", "b": "back"}, default="b")
     if choice == "x" and _confirm_api(ui, "rules"):
         rules_ingest.run(root, "extract", out=ui.out)
+    elif choice == "c" and _confirm_api(ui, "rules"):
+        rules_ingest.run(root, "check", out=ui.out)
     elif choice == "a":
         rules_ingest.run(root, "approve", out=ui.out, ask=ui.ask)
     elif choice == "l":
@@ -5020,6 +5343,31 @@ def test_start_screen_offers_to_draft_facts_and_messages(fresh):
     wizard.fill(ui, fresh, checks["key_messages"])
     assert status(fresh)["facts"] is True and status(fresh)["key_messages"] is True
     assert any("a model drafted them" in row for row in printed)
+
+
+def test_a_garbled_or_russian_layout_answer_does_not_stop_the_menu(fresh):
+    from paperkit import keys
+
+    def typed(*answers):
+        feed = iter(answers)
+
+        def ask(prompt=""):
+            item = next(feed)
+            if isinstance(item, bytes):                               # what a half-deleted Cyrillic letter leaves behind
+                item.decode("utf-8")
+            return item
+        return ask
+
+    printed = []
+    ui = wizard.UI(ask=typed(b"\xd0r", "к"), out=printed.append, color=False)
+    assert ui.choose("What next?", {"r": "rules", "q": "quit"}) == "r"         # asked again, then the R key in Russian
+    assert any("could not be read" in row for row in printed)
+    ui = wizard.UI(ask=typed("н", "да", "нет", "т", "", "Y"), out=printed.append, color=False)
+    assert [ui.confirm("Go on?", False) for _ in range(6)] == [True, True, False, False, False, True]
+    assert keys.latin("й") == "q" and keys.latin("r") == "r"
+    ui = wizard.UI(ask=typed(*[b"\xd0"] * 5), out=printed.append, color=False)
+    with pytest.raises(wizard.Quit):                                           # never readable: leave, do not loop
+        ui.ask("> ")
 
 
 def test_menu_drafts_facts_and_key_messages_and_asks_before_replacing(fresh):
@@ -5926,7 +6274,7 @@ import pytest
 from paperkit import agents, orchestrator, preflight, wizard
 from paperkit.__main__ import main
 from paperkit.ingestion import rules_ingest
-from paperkit.ingestion.rules_ingest import ProposedRule, RuleList
+from paperkit.ingestion.rules_ingest import Clash, ProposedRule, Repeat, RuleCheck, RuleList
 from paperkit.schemas import Claim, ClaimList, Draft, Review
 from paperkit.validators import blocking
 
@@ -6191,6 +6539,120 @@ def test_no_guides_and_a_broken_rule_file_are_said_plainly(project, capsys):
     (project / "rules" / "candidates.json").write_text("{not json", encoding="utf-8")
     assert main(["--root", str(project), "rules", "list"]) == 1
     assert "rules/candidates.json is not valid" in capsys.readouterr().out
+
+
+STYLE = ("Style guide\n\nGive the limitations of the study a paragraph of their own. "
+         "Authors may describe findings as novel when they are. "
+         "The Discussion should begin with a brief summary of the main findings.")
+G_LIMITS = ProposedRule(instruction="State the limitations in their own paragraph.",       # word for word as LIMITS
+                        quote="Give the limitations of the study a paragraph of their own.", priority="optional")
+G_NOVEL = ProposedRule(instruction="You may call a finding novel.", priority="optional",
+                       quote="Authors may describe findings as novel when they are.")
+G_SUMMARY = ProposedRule(instruction="Begin the Discussion by summarising the main findings.", sections=["discussion"],
+                         quote="The Discussion should begin with a brief summary of the main findings.", priority="required",
+                         category="structure")
+IN_METHODS = ProposedRule(instruction="Describe payment in the Methods.", sections=["methods"],
+                          quote="The fee is paid on acceptance of the paper.")
+WHY = "One allows the word novel and the other bans it."
+COMPARED = RuleCheck(
+    repeats=[Repeat(ids=["R3", "r4", "R99"]),              # the same point in other words; R99 does not exist
+             Repeat(ids=["R4", "R3"])],                    # the same group named twice: both are taken already
+    contradictions=[Clash(first="R2", second="R5", reason=WHY), Clash(first="R5", second="R2", reason="said twice"),
+                    Clash(first="R7", second="R4", reason="R7 is for the Methods: it was never shown to the model"),
+                    Clash(first="R3", second="R4", reason="a rule cannot clash with its own repeat")])
+
+
+def two_guides(project, compared=COMPARED):
+    """Rules from two guides: R1-R3 from general/style.txt, R4-R7 from journal/authors.txt."""
+    (project / ".writing_guides" / "general").mkdir()
+    (project / ".writing_guides" / "general" / "style.txt").write_text(STYLE, encoding="utf-8")
+
+    def llm(system, user, schema):
+        if schema is RuleList:
+            return RuleList(rules=[G_LIMITS, G_NOVEL, G_SUMMARY] if "Style guide" in user
+                            else [SUMMARY, BANNED, LIMITS, IN_METHODS])
+        if schema is RuleCheck:
+            if compared is None:
+                raise RuntimeError("NVIDIA API, model x: HTTP 504")
+            return compared
+        raise AssertionError(schema)
+
+    agents.LLM = llm
+    rules_ingest.extract(project)
+    return {r["id"]: r for r in stored(project)}
+
+
+def test_check_drops_repeats_and_flags_contradictions(project, capsys):
+    before = two_guides(project)
+    assert [r["instruction"] for r in before.values()][:3] == [G_LIMITS.instruction, G_NOVEL.instruction, G_SUMMARY.instruction]
+    feed, printed = iter(["c", "y"]), []                              # menu: check the rules, and yes to the API call
+    ui = wizard.UI(ask=lambda prompt="": next(feed), out=lambda text="": printed.append(str(text)), color=False)
+    wizard.act_rules(ui, project)
+    text = "\n".join(printed)
+    assert "Repeats dropped: 2" in text and "Contradictions: 1   <- settle these" in text
+    assert "R6 kept (.writing_guides/journal/authors.txt, recommended, all)" in text and "dropped R1 (" in text
+    assert f"why: {WHY}" in text and "paperkit rules restore <id>" in text
+
+    rules = {r["id"]: r for r in stored(project)}
+    assert rules["R1"]["duplicate_of"] == "R6" and rules["R6"]["sections"] == ["all"]      # the journal's wording, the wider scope
+    assert rules["R3"]["duplicate_of"] == "R4"
+    assert (rules["R4"]["priority"], rules["R4"]["severity"]) == ("required", "blocking")   # the stricter of the two
+    assert rules["R2"]["conflicts"] == {"R5": WHY} and rules["R5"]["conflicts"] == {"R2": WHY}
+    assert rules["R7"]["conflicts"] == {} and rules["R4"]["conflicts"] == {}
+    assert "rules: 6 rule(s) compared. 1 more are for sections that paper.yaml does not have" in text
+    assert "language rules, group 1 of 2 (4 rules)" in text and "structure rules, group 2 of 2 (2 rules)" in text
+    assert rules_ingest.state(project) == {"guides": 2, "candidates": 5, "relevant": 4, "approved": 0, "dropped": 2,
+                                           "conflicts": 1}
+    check = next(c for c in preflight.check_inputs(project) if c.key == "guides")
+    assert "0 of 4 rule(s) approved, 1 for other sections, 1 contradiction(s) to settle" in check.detail
+    asked = []
+    assert rules_ingest.review(project, ask=lambda prompt: "q", out=asked.append) == 0      # R7 is not asked about
+    assert "1 rule(s) are for sections that paper.yaml does not have (methods)" in asked[0] and "Rule 1 of 4" in asked
+
+    assert main(["--root", str(project), "rules", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "[=] R1  optional, all:" in out and "dropped: it repeats R6" in out and f"CONTRADICTS R5: {WHY}" in out
+    assert "2 dropped as repeats [=]. 1 contradiction(s) to settle." in out
+
+    assert main(["--root", str(project), "rules", "approve", "R1"]) == 1          # a dropped rule cannot be approved
+    assert "R1 was dropped because it repeats R6" in capsys.readouterr().out
+    assert main(["--root", str(project), "rules", "approve", "--all"]) == 0
+    out = capsys.readouterr().out
+    assert "All 5 rule(s) approved." in out and "WARNING: R2 and R5 contradict each other and both are approved" in out
+    assert [r["id"] for r in stored(project, "active_rules")] == ["R2", "R4", "R5", "R6", "R7"]
+    assert main(["--root", str(project), "rules", "check"]) == 1                  # two rules in use contradict: exit code 1
+
+    said = []
+    p = orchestrator.Project(project)
+    agents.LLM = pipeline_model([GOOD], [])
+    orchestrator.plan(p, "discussion")
+    orchestrator.approve(p, "discussion")
+    assert orchestrator.run_section(p, "discussion", said.append) == "DONE"
+    assert any("warning: writing rules R2 and R5 contradict each other" in row for row in said)
+
+    capsys.readouterr()
+    assert main(["--root", str(project), "rules", "reject", "R2"]) == 0
+    assert "WARNING" not in capsys.readouterr().out
+    assert main(["--root", str(project), "rules", "restore", "R1"]) == 0
+    assert "1 rule(s) brought back as candidates: R1." in capsys.readouterr().out
+    two = COMPARED                                                    # the same answer again: R1 is not dropped twice
+    agents.LLM = lambda system, user, schema: two
+    assert main(["--root", str(project), "rules", "check", "--fresh"]) == 0
+    rules = {r["id"]: r for r in stored(project)}
+    assert rules["R1"]["duplicate_of"] == "none" and rules["R1"]["approved"] is False
+    assert rules["R3"]["duplicate_of"] == "R4" and rules["R5"]["conflicts"] == {"R2": WHY}
+
+
+def test_check_still_drops_word_for_word_repeats_when_the_model_fails(project, capsys):
+    two_guides(project, compared=None)
+    assert main(["--root", str(project), "rules", "check"]) == 1
+    out = capsys.readouterr().out
+    assert "Repeats dropped: 1" in out and "dropped R1 (" in out and "Contradictions: 0" in out
+    assert "failed: language rules: RuntimeError: NVIDIA API, model x: HTTP 504" in out
+    assert "failed: structure rules: RuntimeError" in out and "finished groups are kept" in out
+    (project / "rules" / "candidates.json").write_text("[]", encoding="utf-8")
+    assert main(["--root", str(project), "rules", "check"]) == 1
+    assert "fewer than two rules for this paper's sections to compare" in capsys.readouterr().out
 
 
 def test_checklist_and_menu_show_the_guides(project):

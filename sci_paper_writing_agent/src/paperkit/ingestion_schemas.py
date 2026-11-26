@@ -97,6 +97,8 @@ class WritingRule(BaseModel):
     source_quote: str | None = None
     group: str = ""
     avoid_terms: list[str] = Field(default_factory=list)
+    duplicate_of: str = ""
+    conflicts: dict[str, str] = Field(default_factory=dict)
     approved: bool = False
 
 

@@ -9,7 +9,7 @@ import pytest
 from paperkit import agents, orchestrator, preflight, wizard
 from paperkit.__main__ import main
 from paperkit.ingestion import rules_ingest
-from paperkit.ingestion.rules_ingest import ProposedRule, RuleList
+from paperkit.ingestion.rules_ingest import Clash, ProposedRule, Repeat, RuleCheck, RuleList
 from paperkit.schemas import Claim, ClaimList, Draft, Review
 from paperkit.validators import blocking
 
@@ -274,6 +274,120 @@ def test_no_guides_and_a_broken_rule_file_are_said_plainly(project, capsys):
     (project / "rules" / "candidates.json").write_text("{not json", encoding="utf-8")
     assert main(["--root", str(project), "rules", "list"]) == 1
     assert "rules/candidates.json is not valid" in capsys.readouterr().out
+
+
+STYLE = ("Style guide\n\nGive the limitations of the study a paragraph of their own. "
+         "Authors may describe findings as novel when they are. "
+         "The Discussion should begin with a brief summary of the main findings.")
+G_LIMITS = ProposedRule(instruction="State the limitations in their own paragraph.",       # word for word as LIMITS
+                        quote="Give the limitations of the study a paragraph of their own.", priority="optional")
+G_NOVEL = ProposedRule(instruction="You may call a finding novel.", priority="optional",
+                       quote="Authors may describe findings as novel when they are.")
+G_SUMMARY = ProposedRule(instruction="Begin the Discussion by summarising the main findings.", sections=["discussion"],
+                         quote="The Discussion should begin with a brief summary of the main findings.", priority="required",
+                         category="structure")
+IN_METHODS = ProposedRule(instruction="Describe payment in the Methods.", sections=["methods"],
+                          quote="The fee is paid on acceptance of the paper.")
+WHY = "One allows the word novel and the other bans it."
+COMPARED = RuleCheck(
+    repeats=[Repeat(ids=["R3", "r4", "R99"]),              # the same point in other words; R99 does not exist
+             Repeat(ids=["R4", "R3"])],                    # the same group named twice: both are taken already
+    contradictions=[Clash(first="R2", second="R5", reason=WHY), Clash(first="R5", second="R2", reason="said twice"),
+                    Clash(first="R7", second="R4", reason="R7 is for the Methods: it was never shown to the model"),
+                    Clash(first="R3", second="R4", reason="a rule cannot clash with its own repeat")])
+
+
+def two_guides(project, compared=COMPARED):
+    """Rules from two guides: R1-R3 from general/style.txt, R4-R7 from journal/authors.txt."""
+    (project / ".writing_guides" / "general").mkdir()
+    (project / ".writing_guides" / "general" / "style.txt").write_text(STYLE, encoding="utf-8")
+
+    def llm(system, user, schema):
+        if schema is RuleList:
+            return RuleList(rules=[G_LIMITS, G_NOVEL, G_SUMMARY] if "Style guide" in user
+                            else [SUMMARY, BANNED, LIMITS, IN_METHODS])
+        if schema is RuleCheck:
+            if compared is None:
+                raise RuntimeError("NVIDIA API, model x: HTTP 504")
+            return compared
+        raise AssertionError(schema)
+
+    agents.LLM = llm
+    rules_ingest.extract(project)
+    return {r["id"]: r for r in stored(project)}
+
+
+def test_check_drops_repeats_and_flags_contradictions(project, capsys):
+    before = two_guides(project)
+    assert [r["instruction"] for r in before.values()][:3] == [G_LIMITS.instruction, G_NOVEL.instruction, G_SUMMARY.instruction]
+    feed, printed = iter(["c", "y"]), []                              # menu: check the rules, and yes to the API call
+    ui = wizard.UI(ask=lambda prompt="": next(feed), out=lambda text="": printed.append(str(text)), color=False)
+    wizard.act_rules(ui, project)
+    text = "\n".join(printed)
+    assert "Repeats dropped: 2" in text and "Contradictions: 1   <- settle these" in text
+    assert "R6 kept (.writing_guides/journal/authors.txt, recommended, all)" in text and "dropped R1 (" in text
+    assert f"why: {WHY}" in text and "paperkit rules restore <id>" in text
+
+    rules = {r["id"]: r for r in stored(project)}
+    assert rules["R1"]["duplicate_of"] == "R6" and rules["R6"]["sections"] == ["all"]      # the journal's wording, the wider scope
+    assert rules["R3"]["duplicate_of"] == "R4"
+    assert (rules["R4"]["priority"], rules["R4"]["severity"]) == ("required", "blocking")   # the stricter of the two
+    assert rules["R2"]["conflicts"] == {"R5": WHY} and rules["R5"]["conflicts"] == {"R2": WHY}
+    assert rules["R7"]["conflicts"] == {} and rules["R4"]["conflicts"] == {}
+    assert "rules: 6 rule(s) compared. 1 more are for sections that paper.yaml does not have" in text
+    assert "language rules, group 1 of 2 (4 rules)" in text and "structure rules, group 2 of 2 (2 rules)" in text
+    assert rules_ingest.state(project) == {"guides": 2, "candidates": 5, "relevant": 4, "approved": 0, "dropped": 2,
+                                           "conflicts": 1}
+    check = next(c for c in preflight.check_inputs(project) if c.key == "guides")
+    assert "0 of 4 rule(s) approved, 1 for other sections, 1 contradiction(s) to settle" in check.detail
+    asked = []
+    assert rules_ingest.review(project, ask=lambda prompt: "q", out=asked.append) == 0      # R7 is not asked about
+    assert "1 rule(s) are for sections that paper.yaml does not have (methods)" in asked[0] and "Rule 1 of 4" in asked
+
+    assert main(["--root", str(project), "rules", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "[=] R1  optional, all:" in out and "dropped: it repeats R6" in out and f"CONTRADICTS R5: {WHY}" in out
+    assert "2 dropped as repeats [=]. 1 contradiction(s) to settle." in out
+
+    assert main(["--root", str(project), "rules", "approve", "R1"]) == 1          # a dropped rule cannot be approved
+    assert "R1 was dropped because it repeats R6" in capsys.readouterr().out
+    assert main(["--root", str(project), "rules", "approve", "--all"]) == 0
+    out = capsys.readouterr().out
+    assert "All 5 rule(s) approved." in out and "WARNING: R2 and R5 contradict each other and both are approved" in out
+    assert [r["id"] for r in stored(project, "active_rules")] == ["R2", "R4", "R5", "R6", "R7"]
+    assert main(["--root", str(project), "rules", "check"]) == 1                  # two rules in use contradict: exit code 1
+
+    said = []
+    p = orchestrator.Project(project)
+    agents.LLM = pipeline_model([GOOD], [])
+    orchestrator.plan(p, "discussion")
+    orchestrator.approve(p, "discussion")
+    assert orchestrator.run_section(p, "discussion", said.append) == "DONE"
+    assert any("warning: writing rules R2 and R5 contradict each other" in row for row in said)
+
+    capsys.readouterr()
+    assert main(["--root", str(project), "rules", "reject", "R2"]) == 0
+    assert "WARNING" not in capsys.readouterr().out
+    assert main(["--root", str(project), "rules", "restore", "R1"]) == 0
+    assert "1 rule(s) brought back as candidates: R1." in capsys.readouterr().out
+    two = COMPARED                                                    # the same answer again: R1 is not dropped twice
+    agents.LLM = lambda system, user, schema: two
+    assert main(["--root", str(project), "rules", "check", "--fresh"]) == 0
+    rules = {r["id"]: r for r in stored(project)}
+    assert rules["R1"]["duplicate_of"] == "none" and rules["R1"]["approved"] is False
+    assert rules["R3"]["duplicate_of"] == "R4" and rules["R5"]["conflicts"] == {"R2": WHY}
+
+
+def test_check_still_drops_word_for_word_repeats_when_the_model_fails(project, capsys):
+    two_guides(project, compared=None)
+    assert main(["--root", str(project), "rules", "check"]) == 1
+    out = capsys.readouterr().out
+    assert "Repeats dropped: 1" in out and "dropped R1 (" in out and "Contradictions: 0" in out
+    assert "failed: language rules: RuntimeError: NVIDIA API, model x: HTTP 504" in out
+    assert "failed: structure rules: RuntimeError" in out and "finished groups are kept" in out
+    (project / "rules" / "candidates.json").write_text("[]", encoding="utf-8")
+    assert main(["--root", str(project), "rules", "check"]) == 1
+    assert "fewer than two rules for this paper's sections to compare" in capsys.readouterr().out
 
 
 def test_checklist_and_menu_show_the_guides(project):

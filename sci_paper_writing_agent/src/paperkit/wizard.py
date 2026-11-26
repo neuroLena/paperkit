@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import agents, build, dryrun, env, evidence, extract, facts, orchestrator, preflight, zotero
+from . import agents, build, dryrun, env, evidence, extract, facts, keys, orchestrator, preflight, zotero
 from .ingestion import rules_ingest
 from .schemas import ClaimTable, Issue
 from .validators import blocking
@@ -41,7 +41,7 @@ MENU = {
     "9": "Choose the model provider and test the connection",
     "f": "Draft facts.csv from the Results section           (calls the API)",
     "k": "Draft key_messages.md from the Results section     (calls the API)",
-    "r": "Writing rules from the guides in .writing_guides   (reading them calls the API)",
+    "r": "Writing rules: read the guides, check, approve     (reading and checking call the API)",
     "e": "Search the literature for a section's claims       (calls the API and Semantic Scholar)",
     "q": "Quit",
 }
@@ -71,7 +71,7 @@ class UI:
 
     def ask(self, prompt: str, strip: bool = True) -> str:
         try:
-            answer = self._ask(prompt)
+            answer = keys.read(self._ask, prompt, self.out)       # a garbled answer is asked for again
         except (EOFError, KeyboardInterrupt, StopIteration):
             raise Quit from None
         return answer.strip() if strip else answer.rstrip("\r\n")
@@ -81,7 +81,7 @@ class UI:
 
     def confirm(self, prompt: str, default: bool = True) -> bool:
         answer = self.ask(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").lower()
-        return default if not answer else answer.startswith("y")
+        return default if not answer else keys.is_yes(answer)
 
     def choose(self, prompt: str, options: dict[str, str], default: str = "") -> str:
         self.out(prompt)
@@ -89,6 +89,8 @@ class UI:
             self.out(f"  [{key}] {label}")
         while True:
             answer = self.ask(f"> [{default}] " if default else "> ").lower() or default
+            if answer not in options and keys.latin(answer) in options:
+                answer = keys.latin(answer)                        # the right key on the Russian layout
             if answer in options:
                 return answer
             self.out(f"Type one of: {', '.join(options)}")
@@ -105,7 +107,7 @@ class UI:
 
     def secret(self, prompt: str) -> str:
         try:
-            return self._secret(prompt).strip()
+            return keys.read(self._secret, prompt, self.out).strip()
         except (EOFError, KeyboardInterrupt, StopIteration):
             raise Quit from None
 
@@ -554,13 +556,17 @@ def act_models(ui: UI, root: Path) -> None:
 
 def act_rules(ui: UI, root: Path) -> None:
     found = rules_ingest.state(root)
-    ui.out(f"{found['guides']} guide file(s) in {rules_ingest.GUIDES}/, {found['candidates']} candidate rule(s), "
-           f"{found['approved']} approved.")
+    ui.out(f"{found['guides']} guide file(s) in {rules_ingest.GUIDES}/. {found['relevant']} rule(s) for this paper's "
+           f"sections ({found['candidates'] - found['relevant']} more for other sections): {found['approved']} approved, "
+           f"{found['dropped']} dropped as repeats, {found['conflicts']} contradiction(s) to settle.")
     choice = ui.choose("What now?", {"x": "read the guides and propose rules (calls the API)",
+                                     "c": "check the rules: drop repeats, flag contradictions (calls the API)",
                                      "a": "go through the rules that are not approved yet",
                                      "l": "list all rules", "b": "back"}, default="b")
     if choice == "x" and _confirm_api(ui, "rules"):
         rules_ingest.run(root, "extract", out=ui.out)
+    elif choice == "c" and _confirm_api(ui, "rules"):
+        rules_ingest.run(root, "check", out=ui.out)
     elif choice == "a":
         rules_ingest.run(root, "approve", out=ui.out, ask=ui.ask)
     elif choice == "l":

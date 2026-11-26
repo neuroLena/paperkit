@@ -8,6 +8,10 @@ The model proposes; code verifies; a person approves:
 - kept rules go to rules/candidates.json with approved set to false. Only approved rules, which are copied to
   rules/active_rules.json, ever reach the writer, the reviewer and the gate;
 - every answered part is saved in .cache/guides/, so a run that failed half way continues where it stopped.
+
+`check` is a separate step for after the guides are read. It drops rules that repeat another rule and marks
+rules that contradict each other. Nothing is deleted: a dropped rule stays in rules/candidates.json with a note
+of the rule it repeats, and `restore` brings it back.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
-from .. import agents
+from .. import agents, keys
 from ..ingestion_schemas import WritingRule
 
 GUIDES = ".writing_guides"
@@ -30,6 +34,9 @@ CATEGORIES = ("structure", "argumentation", "language", "statistics", "reporting
               "scientific_reasoning")
 PRIORITIES = ("required", "recommended", "optional")
 MIN_QUOTE_WORDS = 3
+KEPT_BY_HAND = "none"           # duplicate_of of a rule a person restored: it is never dropped again
+STRENGTH = {"required": 0, "recommended": 1, "optional": 2}
+AUTHORITY = {"journal": 0, "reporting": 1, "general": 2}       # whose wording is kept when two guides say the same
 NONE_YET = f"No rules yet. Put the guides in {GUIDES}/ and run: paperkit rules extract"
 
 PROMPT = """You read part of a writing guide (a journal's instructions for authors, a reporting guideline or a style guide) and list the rules that say how the TEXT of a scientific paper must be written. You write no prose.
@@ -57,6 +64,32 @@ class ProposedRule(BaseModel):
 
 class RuleList(BaseModel):
     rules: list[ProposedRule] = Field(default_factory=list)
+
+
+COMPARE = """You compare writing rules that were taken from several guides. You change no rule and you write no new one.
+
+Each line of <rules> is: id [sections; priority; kind of guide] instruction.
+
+Return:
+- repeats: groups of rule ids that ask for the same thing, so that a text that follows one of them follows the others too. The same requirement in other words is a repeat. A stricter, narrower or more detailed version is NOT a repeat: leave it out. Put an id in one group at most.
+- contradictions: pairs of rule ids that cannot both be followed in the same section, each with a one-sentence reason. Examples: two different word limits for the same section; one rule requires what the other forbids. Rules for different sections do not contradict each other. A general rule and a stricter rule on the same point do not contradict each other.
+
+If there are none, return empty lists. Use only ids that are in <rules>."""
+
+
+class Repeat(BaseModel):
+    ids: list[str] = Field(description="Ids of rules that ask for the same thing")
+
+
+class Clash(BaseModel):
+    first: str = Field(description="A rule id")
+    second: str = Field(description="The id of the rule it contradicts")
+    reason: str = Field(default="", description="One sentence: why both cannot be followed")
+
+
+class RuleCheck(BaseModel):
+    repeats: list[Repeat] = Field(default_factory=list)
+    contradictions: list[Clash] = Field(default_factory=list)
 
 
 # ------------------------------------------------------------------ reading
@@ -159,12 +192,52 @@ def for_section(root: str | Path, sec_id: str, title: str = "") -> list[WritingR
     return [r for r in load(root, "active_rules") if r.approved and names & {s.lower() for s in r.sections}]
 
 
+def dropped(rule: WritingRule) -> bool:
+    """True for a rule that `check` set aside because it repeats another rule."""
+    return rule.duplicate_of not in ("", KEPT_BY_HAND)
+
+
+def paper_sections(root: str | Path) -> set[str]:
+    """The names a rule can use for a section of this paper: the ids and titles in paper.yaml, and "all"."""
+    names = {"all"}
+    try:
+        raw = yaml.safe_load((Path(root) / "paper.yaml").read_text(encoding="utf-8")) or {}
+        for sec in raw.get("sections", []):
+            if isinstance(sec, dict):
+                names |= {str(sec[k]).lower() for k in ("id", "title") if sec.get(k)}
+    except Exception:
+        pass
+    return names
+
+
+def relevant(rule: WritingRule, names: set[str]) -> bool:
+    """True if the rule can apply to a section this paper has. Guides are full of rules for other sections
+    (abstract, methods, references ...): those are kept but not compared, and you are not asked about them."""
+    return len(names) == 1 or bool(names & {s.lower() for s in rule.sections})
+
+
+def _number(rule: WritingRule) -> int:
+    found = re.fullmatch(r"R(\d+)", rule.id)
+    return int(found.group(1)) if found else 10 ** 9
+
+
+def clashes(rules: list[WritingRule], approved_only: bool = False) -> list[tuple[str, str, str]]:
+    """(id, id, reason) for every pair of rules marked as contradicting. With approved_only: both are in use."""
+    live = {r.id: r for r in rules if not dropped(r) and (r.approved or not approved_only)}
+    return [(r.id, other, reason) for r in sorted(live.values(), key=_number) for other, reason in r.conflicts.items()
+            if other in live and _number(r) < _number(live[other])]
+
+
 def state(root: str | Path) -> dict:
     try:
         rules = load(root)
     except ValueError:
         rules = []
-    return {"guides": len(guide_files(root)), "candidates": len(rules), "approved": sum(r.approved for r in rules)}
+    names = paper_sections(root)
+    live = [r for r in rules if not dropped(r)]
+    ours = [r for r in live if relevant(r, names)]
+    return {"guides": len(guide_files(root)), "candidates": len(live), "relevant": len(ours),
+            "approved": sum(r.approved for r in ours), "dropped": len(rules) - len(live), "conflicts": len(clashes(rules))}
 
 
 # ------------------------------------------------------------------ checking a proposal
@@ -323,6 +396,148 @@ def extract(root: str | Path, fresh: bool = False, say=lambda text: None) -> dic
     return {"files": len(files), "rules": final, "new": new, "dropped": dropped, "failed": failed}
 
 
+# ------------------------------------------------------------------ repeats and contradictions
+
+def _overlap(first: WritingRule, second: WritingRule) -> bool:
+    """True if both rules can apply to the same section. Rules for different sections neither repeat nor contradict."""
+    one, two = {s.lower() for s in first.sections}, {s.lower() for s in second.sections}
+    return "all" in one or "all" in two or bool(one & two)
+
+
+def check(root: str | Path, fresh: bool = False, say=lambda text: None) -> dict:
+    """Drops rules that repeat another rule and marks rules that contradict each other. Run it after `extract`.
+
+    Only rules for the sections this paper has are compared. Word-for-word repeats are found by code. Repeats in
+    other words and contradictions are proposed by the model, one category of rules at a time, and code accepts
+    them only between rules it showed the model that can apply to the same section. Of a group of repeats one
+    rule is kept: an approved one first, then the journal's guide before a reporting guideline before a general
+    style guide. It takes over the widest scope and the strictest priority of the group.
+    """
+    root = Path(root)
+    rules = load(root)
+    names = paper_sections(root)
+    live = [r for r in rules if not dropped(r)]
+    compared = [r for r in live if relevant(r, names)]
+    if len(compared) < 2:
+        raise ValueError("There are fewer than two rules for this paper's sections to compare. "
+                         "Read the guides first: paperkit rules extract")
+    for rule in rules:
+        rule.conflicts = {}                    # worked out again from scratch every time
+    everyone = {r.id.upper(): r for r in rules}
+
+    groups: list[list[WritingRule]] = []
+    word_for_word: dict[str, list[WritingRule]] = {}
+    for rule in compared:
+        word_for_word.setdefault(_key(rule.instruction), []).append(rule)
+    groups += [group for group in word_for_word.values() if len(group) > 1]
+
+    # the model sees one category at a time, at most PAPERKIT_CHECK_RULES rules per request
+    limit = max(2, int(os.environ.get("PAPERKIT_CHECK_RULES") or "80"))
+    by_category: dict[str, list[WritingRule]] = {}
+    for rule in compared:
+        by_category.setdefault(rule.category, []).append(rule)
+    batches: list[tuple[str, list[WritingRule]]] = []
+    for category in sorted(by_category):
+        rows = sorted(by_category[category], key=lambda r: (sorted(x.lower() for x in r.sections), _number(r)))
+        batches += [(category, rows[i:i + limit]) for i in range(0, len(rows), limit) if len(rows[i:i + limit]) > 1]
+
+    agents.LOG_DIR = root / "state" / "log"
+    answers: list[tuple[list[WritingRule], RuleCheck]] = []
+    failed: list[str] = []
+    for number, (category, part) in enumerate(batches, 1):
+        listing = "\n".join(f"{r.id} [{', '.join(r.sections)}; {r.priority}; {r.group or 'general'}] {r.instruction}"
+                            for r in part)
+        digest = hashlib.sha256(json.dumps([COMPARE, listing]).encode("utf-8")).hexdigest()[:24]
+        cache = root / ".cache" / "guides" / f"check-{digest}.json"
+        where = f"rules: {category} rules, group {number} of {len(batches)} ({len(part)} rules)"
+        answer = None
+        if cache.is_file() and not fresh:
+            try:
+                answer = RuleCheck.model_validate_json(cache.read_text(encoding="utf-8"))
+                say(f"{where}: answer kept from an earlier run")
+            except ValueError:
+                answer = None
+        if answer is None:
+            say(f"{where}: asking the model ...")
+            try:
+                answer = agents._ask("rules", COMPARE, agents._tag("rules", listing), RuleCheck)
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(answer.model_dump_json(), encoding="utf-8")
+            except Exception as exc:           # a provider error: the other groups still count
+                failed.append(f"{category} rules: {type(exc).__name__}: {_short(exc)}")
+                continue
+        answers.append((part, answer))
+
+    grouped = {id(r) for group in groups for r in group}
+    for part, answer in answers:
+        shown = {r.id.upper(): r for r in part}
+        for repeat in answer.repeats:
+            members: list[WritingRule] = []
+            for raw in repeat.ids:
+                rule = shown.get(str(raw).strip().upper())
+                if (rule is not None and id(rule) not in grouped and rule not in members
+                        and all(_overlap(rule, other) for other in members)):
+                    members.append(rule)
+            if len(members) > 1:
+                groups.append(members)
+                grouped |= {id(r) for r in members}
+
+    removed: list[tuple[WritingRule, WritingRule]] = []
+    for group in groups:
+        group = [r for r in group if r.duplicate_of != KEPT_BY_HAND]         # a person kept these: never dropped
+        if len(group) < 2:
+            continue
+        kept = min(group, key=lambda r: (not r.approved, AUTHORITY.get(r.group, 3), STRENGTH.get(r.priority, 3), _number(r)))
+        sections = list(dict.fromkeys(x for r in group for x in r.sections))
+        kept.sections = ["all"] if "all" in [x.lower() for x in sections] else sections
+        kept.priority = min((r.priority for r in group), key=lambda name: STRENGTH.get(name, 3))
+        kept.severity = "blocking" if kept.priority == "required" else kept.severity
+        for rule in group:
+            if rule is kept:
+                continue
+            kept.avoid_terms += [t for t in rule.avoid_terms if t.lower() not in [k.lower() for k in kept.avoid_terms]]
+            rule.duplicate_of, rule.approved = kept.id, False
+            removed.append((kept, rule))
+        if kept.avoid_terms:
+            kept.validation_method = "python"
+
+    found: list[tuple[WritingRule, WritingRule, str]] = []
+    for part, answer in answers:
+        shown = {r.id.upper(): r for r in part}
+        for clash in answer.contradictions:
+            pair = []
+            for raw in (clash.first, clash.second):
+                rule = shown.get(str(raw).strip().upper())
+                if rule is not None and dropped(rule):     # it was dropped: the rule it repeats stands in for it
+                    rule = everyone.get(rule.duplicate_of.upper())
+                pair.append(rule)
+            first, second = pair
+            if first is None or second is None or first is second or dropped(first) or dropped(second):
+                continue
+            if not _overlap(first, second) or second.id in first.conflicts:
+                continue
+            reason = _short(clash.reason) or "They cannot both be followed."
+            first.conflicts[second.id] = second.conflicts[first.id] = reason
+            found.append((first, second, reason) if _number(first) < _number(second) else (second, first, reason))
+    save(root, rules)
+    return {"checked": len(compared), "others": len(live) - len(compared), "dropped": removed, "clashes": found,
+            "failed": failed}
+
+
+def restore(root: str | Path, ids) -> list[WritingRule]:
+    """Brings back rules that `check` dropped. They become candidates again and are never dropped a second time."""
+    rules = load(root)
+    wanted = {str(i).upper() for i in ids}
+    unknown = sorted(wanted - {r.id.upper() for r in rules})
+    if unknown:
+        raise ValueError(f"No such rule: {', '.join(unknown)}. `paperkit rules list` shows the ids.")
+    back = [r for r in rules if r.id.upper() in wanted and dropped(r)]
+    for rule in back:
+        rule.duplicate_of = KEPT_BY_HAND
+    save(root, rules)
+    return back
+
+
 # ------------------------------------------------------------------ approval
 
 def set_approved(root: str | Path, ids, value: bool) -> list[WritingRule]:
@@ -331,6 +546,10 @@ def set_approved(root: str | Path, ids, value: bool) -> list[WritingRule]:
     unknown = sorted(wanted - {r.id.upper() for r in rules})
     if unknown:
         raise ValueError(f"No such rule: {', '.join(unknown)}. `paperkit rules list` shows the ids.")
+    gone = [r for r in rules if value and r.id.upper() in wanted and dropped(r)]
+    if gone:
+        raise ValueError(f"{gone[0].id} was dropped because it repeats {gone[0].duplicate_of}. "
+                         f"To use it after all: paperkit rules restore {gone[0].id}")
     for rule in rules:
         if rule.id.upper() in wanted:
             rule.approved = value
@@ -340,17 +559,28 @@ def set_approved(root: str | Path, ids, value: bool) -> list[WritingRule]:
 
 def show(rule: WritingRule) -> list[str]:
     where = rule.source_file + (f", p. {rule.source_page}" if rule.source_page else "")
-    rows = [f"[{'x' if rule.approved else ' '}] {rule.id}  {rule.priority}, {', '.join(rule.sections)}: {rule.instruction}",
+    mark = "=" if dropped(rule) else "x" if rule.approved else " "
+    rows = [f"[{mark}] {rule.id}  {rule.priority}, {', '.join(rule.sections)}: {rule.instruction}",
             f'      "{_short(rule.source_quote or "", 220)}"  ({where})']
     if rule.avoid_terms:
         rows.append(f"      code will flag: {', '.join(rule.avoid_terms)}")
+    if dropped(rule):
+        rows.append(f"      dropped: it repeats {rule.duplicate_of} (to use it after all: paperkit rules restore {rule.id})")
+    for other, reason in rule.conflicts.items():
+        rows.append(f"      CONTRADICTS {other}: {reason}")
     return rows
 
 
 def review(root: str | Path, ask=input, out=print) -> int:
     """Walks through the candidates that are not approved yet. Returns how many were approved."""
     rules = load(root)
-    waiting = [r for r in rules if not r.approved]
+    names = paper_sections(root)
+    waiting = [r for r in rules if not r.approved and not dropped(r) and relevant(r, names)]
+    elsewhere = [r for r in rules if not r.approved and not dropped(r) and not relevant(r, names)]
+    if elsewhere:
+        other = sorted({x.lower() for r in elsewhere for x in r.sections})
+        out(f"{len(elsewhere)} rule(s) are for sections that paper.yaml does not have ({', '.join(other[:8])}"
+            f"{', ...' if len(other) > 8 else ''}): you are not asked about them. `paperkit rules list` shows them.")
     count = 0
     try:
         for number, rule in enumerate(waiting, 1):
@@ -358,7 +588,8 @@ def review(root: str | Path, ask=input, out=print) -> int:
             out(f"Rule {number} of {len(waiting)}")
             for row in show(rule):
                 out(row)
-            answer = ask("[y] approve  [n] leave out  [a] approve this and all the rest  [q] stop > ").strip().lower()[:1]
+            answer = keys.latin(keys.read(
+                ask, "[y] approve  [n] leave out  [a] approve this and all the rest  [q] stop > ", out).strip().lower())[:1]
             if answer == "a":
                 for rest in waiting[number - 1:]:
                     rest.approved = True
@@ -380,7 +611,7 @@ def review(root: str | Path, ask=input, out=print) -> int:
 
 def run(root: str | Path, action: str = "list", ids=(), everything: bool = False, fresh: bool = False,
         out=print, ask=input) -> int:
-    """extract | list | approve | reject. Exit code 1 if something failed."""
+    """extract | check | list | approve | reject | restore. Exit code 1 if something failed."""
     root = Path(root)
     try:
         if action == "extract":
@@ -396,9 +627,41 @@ def run(root: str | Path, action: str = "list", ids=(), everything: bool = False
                 out(f"  failed: {row}")
             if got["failed"]:
                 out("Run it again for what failed: finished parts are kept and are not asked again.")
+            if len(got["rules"]) > 1:
+                out("Next, drop repeated rules and find contradictions: paperkit rules check")
             if len(got["rules"]) > approved:
                 out("Nothing is used until you approve it: paperkit rules approve")
             return 1 if got["failed"] else 0
+
+        if action == "check":
+            got = check(root, fresh, out)
+            out(f"rules: {got['checked']} rule(s) compared."
+                + (f" {got['others']} more are for sections that paper.yaml does not have: they were left alone."
+                   if got["others"] else ""))
+            out(f"Repeats dropped: {len(got['dropped'])}")
+            for kept in dict.fromkeys(k.id for k, _ in got["dropped"]):
+                first = next(k for k, _ in got["dropped"] if k.id == kept)
+                out(f"  {first.id} kept ({first.source_file}, {first.priority}, {', '.join(first.sections)}): {first.instruction}")
+                for _, gone in [pair for pair in got["dropped"] if pair[0].id == kept]:
+                    out(f"      dropped {gone.id} ({gone.source_file}): {gone.instruction}")
+            if got["dropped"]:
+                out("  A dropped rule stays in rules/candidates.json. To use one after all: paperkit rules restore <id>")
+            out(f"Contradictions: {len(got['clashes'])}" + ("   <- settle these" if got["clashes"] else ""))
+            for first, second, reason in got["clashes"]:
+                for rule in (first, second):
+                    where = rule.source_file + (f", p. {rule.source_page}" if rule.source_page else "")
+                    out(f"  {rule.id} ({where}, {rule.priority}{', approved' if rule.approved else ''}): {rule.instruction}")
+                out(f"      why: {reason}")
+            if got["clashes"]:
+                out("  Use one rule of each pair. Take the other out with: paperkit rules reject <id>")
+            for row in got["failed"]:
+                out(f"  failed: {row}")
+            if got["failed"]:
+                out("  Those rules were only checked for word-for-word repeats. Run it again: finished groups are kept.")
+            in_use = clashes(load(root), approved_only=True)
+            for first_id, second_id, _ in in_use:
+                out(f"WARNING: {first_id} and {second_id} contradict each other and both are approved.")
+            return 1 if got["failed"] or in_use else 0
 
         rules = load(root)
         if action == "list":
@@ -408,27 +671,41 @@ def run(root: str | Path, action: str = "list", ids=(), everything: bool = False
             for rule in rules:
                 for row in show(rule):
                     out(row)
-            out(f"{sum(r.approved for r in rules)} of {len(rules)} approved. Approved rules are in rules/active_rules.json.")
+            live = [r for r in rules if not dropped(r)]
+            out(f"{sum(r.approved for r in live)} of {len(live)} approved. Approved rules are in rules/active_rules.json."
+                + (f" {len(rules) - len(live)} dropped as repeats [=]." if len(rules) > len(live) else "")
+                + (f" {len(clashes(rules))} contradiction(s) to settle." if clashes(rules) else ""))
             return 0
         if not rules:
             out(NONE_YET)
             return 1
+        if action == "restore":
+            if not ids:
+                out("Name the dropped rules to bring back, for example: paperkit rules restore R7")
+                return 1
+            back = restore(root, ids)
+            out(f"{len(back)} rule(s) brought back as candidates" + (f": {', '.join(r.id for r in back)}." if back else "."))
+            return 0
         if action == "reject":
             if not ids:
                 out("Name the rules to take out, for example: paperkit rules reject R3 R7")
                 return 1
             out(f"{len(set_approved(root, ids, False))} rule(s) taken out.")
         elif everything:
-            for rule in rules:
+            live = [r for r in rules if not dropped(r)]
+            for rule in live:
                 rule.approved = True
             save(root, rules)
-            out(f"All {len(rules)} rule(s) approved.")
+            out(f"All {len(live)} rule(s) approved.")
         elif ids:
             out(f"{len(set_approved(root, ids, True))} rule(s) approved.")
         else:
             out(f"{review(root, ask, out)} rule(s) approved.")
         active = len(load(root, "active_rules"))
         out(f"{active} rule(s) in rules/active_rules.json: the writer and reviewer get the ones for their section.")
+        for first_id, second_id, reason in clashes(load(root), approved_only=True):
+            out(f"WARNING: {first_id} and {second_id} contradict each other and both are approved: {reason} "
+                f"Take one of them out: paperkit rules reject <id>")
         return 0
     except (ValueError, RuntimeError, OSError) as exc:
         out(f"rules: {type(exc).__name__}: {_short(exc, 300)}")
