@@ -79,8 +79,8 @@ The repository is the folder above this one, the one that holds `setup.sh`, `sca
 `bash publish.sh "what changed"` in that folder commits everything and pushes it to GitHub.
 
 The one `.gitignore` is in that folder too. It keeps keys (`.env`), the virtual environment, caches,
-model call logs (`state/log/`), `build/` and your source PDFs (`.papers/`) out of git. Inputs, claim
-tables, drafts and reviews are tracked, so every round leaves a history you can diff.
+model call logs, `build/` and your source PDFs (`.papers/`) out of git. So are `inputs/`, `drafts/`, `state/`
+(claim tables, reviews, logs) and `facts/`: the code, config, rules, wiki and references are tracked.
 
 ## Models
 
@@ -90,6 +90,12 @@ Each agent calls the provider and model set in `config/models.yaml`. `PAPERKIT_P
 endpoints at build.nvidia.com, or a local NIM through `NVIDIA_BASE_URL`).
 
 `paperkit ping` shows which model each agent uses and sends each one a small test request.
+
+The free NVIDIA endpoints can be slow, and their gateway drops a request that is silent for 300 seconds
+(HTTP 504). Answers are streamed for that reason. A reasoning model can still think for minutes:
+`PAPERKIT_REASONING=low` in `.env` makes it think less (GLM-5.3 thinks at `max` unless told otherwise),
+and `off` turns thinking off in models that have a switch. If `paperkit ping` fails too, that model's
+endpoint is down or overloaded: wait, or put another model in `config/models.yaml`.
 Menu 9 on the start screen does the same and can save the provider, the model and the key.
 
 ## Workflow
@@ -99,6 +105,7 @@ Menu 9 on the start screen does the same and can save the provider, the model an
 3. `paperkit facts` builds `facts/facts.json` from `inputs/facts.csv`. With no tables, `paperkit extract` drafts `inputs/facts.csv`
    and `inputs/key_messages.md` from the Results section (only while they are empty or still the scaffold's examples;
    `--force` replaces them). Every fact must appear word for word in Results or Methods. Read both files afterwards.
+   `inputs/discussion_draft.md` is an optional starting point: its header explains the [KEEP], [CHANGE: ...] and [WRITE: ...] marks.
 4. `paperkit plan introduction` (and `paperkit plan discussion`) builds the claim table in `state/claims/<section>.json`.
 5. Read and correct the table, then run `paperkit approve introduction`. This is the one required manual check for each section.
 6. `paperkit run introduction` runs the writer -> gates -> reviewer loop and writes `drafts/introduction.md`.
@@ -244,6 +251,43 @@ Your notes for the Introduction: what is known, what is not known, and what this
 ## Aim
 
 - 
+'''
+
+# ----------------------------------------------------------------------------
+# inputs/discussion_draft.md
+# ----------------------------------------------------------------------------
+FILES['inputs/discussion_draft.md'] = r'''
+<!--
+HOW TO USE THIS FILE. This comment is never sent to the model.
+
+Optional. Leave the text below empty and the Discussion is written from scratch. Or paste what you
+already have, in any state, and the planner and the writer start from it.
+
+Write the text as it should read in the paper, with the two rules the checks enforce:
+  - numbers as {{F1}}, {{F2}} ... (the ids in inputs/facts.csv), never as digits
+  - citations as [@citekey], with keys from refs/library.bib
+
+Mark what still needs work at the end of the sentence or paragraph it applies to:
+
+  [KEEP]                    the wording is final: keep it as it is
+  [CHANGE: what to change]  the text is there but must change, for example
+                            [CHANGE: hedge this, the design is observational]
+  [WRITE: what it covers]   nothing is written yet: put this on its own line where the text goes, for example
+                            [WRITE: one paragraph on why the association may differ by age]
+
+Unmarked text is a draft: the model may improve it but keeps its meaning. If the results contradict
+a statement, the claim table says so and you decide. The markers are never copied into the result:
+a marker left in a finished draft is reported as an error.
+Keep the headings the same as the required headings in paper.yaml.
+-->
+
+## Principal findings
+
+## Comparison with prior work
+
+## Limitations
+
+## Conclusion
 '''
 
 # ----------------------------------------------------------------------------
@@ -548,7 +592,7 @@ class Ping(BaseModel):
 def ping_all() -> list[tuple[str, str, str, str]]:
     """One tiny request per distinct provider and model in use: (agents, provider, model, 'ok' or the error)."""
     routes: dict[tuple[str, str], list[str]] = {}
-    for kind in PIPELINE_AGENTS:
+    for kind in (*PIPELINE_AGENTS, "facts"):             # facts: the model behind `paperkit extract facts`
         routes.setdefault(route(kind), []).append(kind)
     rows = []
     for (provider, model), kinds in routes.items():
@@ -602,12 +646,13 @@ Rules:
 - Cover every required heading. In the Discussion, also cover every key message.
 - In the Introduction (section id "introduction"), take the background, the knowledge gap and the aim from <introduction_notes>. State no result of this study and use no OBSERVED claim there. A statement about earlier work is INFERRED, with its cite_keys, and any number in it comes from a fact id.
 - Respect the stated limitations.
-- Do not claim more than the results support."""
+- Do not claim more than the results support.
+- If <starting_draft> is given, it is the author's own draft of this section. Build the claims from it: one claim per statement the author made, in the author's order, with the author's meaning. Text marked [KEEP] is final: keep its claims as they are. At [CHANGE: ...] make that change. At [WRITE: ...] add the claims it asks for, from the results and facts. Drop an author's statement only if the results contradict it; then keep the claim and add "CONTRADICTS: what" to its assumptions."""
 
 
 def plan_claims(sec: SectionSpec, *, design: str, key_messages: str, limitations: str, methods: str,
                 results: str, fact_reg: dict, library: str, wiki_index: str,
-                issues: Sequence[Issue] = (), introduction: str = "") -> list[Claim]:
+                issues: Sequence[Issue] = (), introduction: str = "", starting_draft: str = "") -> list[Claim]:
     user = "\n\n".join([
         _tag("section", _json(sec.model_dump())),
         _tag("study_design", design),
@@ -620,6 +665,8 @@ def plan_claims(sec: SectionSpec, *, design: str, key_messages: str, limitations
         _tag("library", library),
         _tag("wiki_index", wiki_index),
     ])
+    if starting_draft:
+        user += "\n\n" + _tag("starting_draft", starting_draft)
     if issues:
         user += "\n\n" + _tag("problems_in_your_previous_table", _issues(issues))
     return _ask("planner", PLANNER, user, ClaimList).claims
@@ -640,14 +687,16 @@ Code checks the draft and rejects it on any violation:
   ASSUMED: say "this assumes that ..." and whether it was tested.
   SPECULATIVE: "may", "might", "one possibility is".
 - No "novel", "first", "proves", "clearly", "robust". Never "no effect": say "we did not detect".
-- If something you need is missing, write [AUTHOR: what is missing] or [NEEDS SOURCE: what for]. Do not fill the gap yourself."""
+- If something you need is missing, write [AUTHOR: what is missing] or [NEEDS SOURCE: what for]. Do not fill the gap yourself.
+- If <starting_draft> is given, follow it: keep text marked [KEEP] word for word (it still needs its claim tag), make the change at each [CHANGE: ...], and write each [WRITE: ...] from the claims. Never copy the markers [KEEP], [CHANGE: ...] or [WRITE: ...] into your draft."""
 
 OBSERVATIONAL = """
 - The design is observational: no causal wording (cause, lead to, result in, effect of, impact, drive) outside paragraphs tagged only with SPECULATIVE or ASSUMED claims."""
 
 
 def write_section(sec: SectionSpec, *, design: str, claims: Sequence[Claim], fact_reg: dict,
-                  wiki_pages: dict[str, str], prev_draft: str = "", issues: Sequence[Issue] = ()) -> str:
+                  wiki_pages: dict[str, str], prev_draft: str = "", issues: Sequence[Issue] = (),
+                  starting_draft: str = "") -> str:
     system = WRITER + (OBSERVATIONAL if design == "observational" else "")
     user = "\n\n".join([
         _tag("section", _json(sec.model_dump())),
@@ -655,6 +704,8 @@ def write_section(sec: SectionSpec, *, design: str, claims: Sequence[Claim], fac
         _tag("facts", _json(fact_reg)),
         _tag("sources", "\n\n".join(f"## {k}\n{v}" for k, v in wiki_pages.items())),
     ])
+    if starting_draft:
+        user += "\n\n" + _tag("starting_draft", starting_draft)
     if prev_draft:
         user += "\n\n" + _tag("previous_draft", prev_draft)
         user += "\n\n" + _tag("problems_to_fix", _issues(issues))
@@ -851,11 +902,15 @@ def check_claims(table: ClaimTable, fact_reg: dict, bib_keys: set[str]) -> list[
 # src/paperkit/validators/structure.py
 # ----------------------------------------------------------------------------
 FILES['src/paperkit/validators/structure.py'] = r'''
-"""Structure: required headings in order, and the word limit."""
+"""Structure: required headings in order, the word limit, and no action marker left over."""
 from __future__ import annotations
 
+import re
+
 from ..schemas import Issue
-from .common import GateContext, headings, plain
+from .common import GateContext, headings, plain, short
+
+ACTION = re.compile(r"\[(?:WRITE|CHANGE)\b[^\]]*\]|\[KEEP\]")   # marks from inputs/<section>_draft.md
 
 
 def check(draft: str, ctx: GateContext) -> list[Issue]:
@@ -873,6 +928,8 @@ def check(draft: str, ctx: GateContext) -> list[Issue]:
     extra = [h for h in found if h not in ctx.sec.required_headings]
     if ctx.sec.required_headings and extra:
         issues.append(Issue(gate="structure", message=f"Headings not in the spec: {extra}"))
+    for m in ACTION.finditer(draft):
+        issues.append(Issue(gate="structure", message="Action marker left in the draft", excerpt=short(m.group(0))))
     words = len(plain(draft).split())
     if words == 0:
         issues.append(Issue(gate="structure", message="Draft is empty"))
@@ -1275,6 +1332,7 @@ import yaml
 from . import agents, facts, wiki, zotero
 from .schemas import ClaimTable, Issue, PaperSpec
 from .validators import GateContext, blocking, check_claims, run_gates
+from .validators.common import COMMENT
 
 
 def _dump(path: Path, obj) -> None:
@@ -1300,6 +1358,14 @@ class Project:
     def inp(self, name: str) -> str:
         path = self.root / "inputs" / f"{name}.md"
         return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def draft(self, sec_id: str) -> str:
+        """The author's own starting draft, inputs/<section>_draft.md, without its explanatory comment.
+
+        Empty when the file holds nothing but headings, so the default file changes nothing.
+        """
+        text = COMMENT.sub("", self.inp(f"{sec_id}_draft")).strip()
+        return text if any(row.strip() and not row.lstrip().startswith("#") for row in text.splitlines()) else ""
 
     def claims_path(self, sec_id: str) -> Path:
         return self.root / "state" / "claims" / f"{sec_id}.json"
@@ -1333,6 +1399,7 @@ def plan(p: Project, sec_id: str) -> tuple[ClaimTable, list[Issue]]:
         claims = agents.plan_claims(
             sec, design=p.spec.design, key_messages=p.inp("key_messages"), limitations=p.inp("limitations"),
             methods=p.inp("methods"), results=p.inp("results"), introduction=p.inp("introduction"), fact_reg=p.facts,
+            starting_draft=p.draft(sec_id),
             library=zotero.library_listing(p.bib), wiki_index=wiki.index(p.root / "wiki"), issues=issues)
         table = ClaimTable(section_id=sec_id, approved=False, claims=claims)
         issues = blocking(check_claims(table, p.facts, set(p.bib)))
@@ -1376,7 +1443,8 @@ def run_section(p: Project, sec_id: str) -> str:
     draft, issues = "", []
     for rnd in range(1, p.spec.max_rounds + 1):
         draft = agents.write_section(sec, design=p.spec.design, claims=table.claims, fact_reg=fact_sub,
-                                     wiki_pages=pages, prev_draft=draft, issues=issues)
+                                     wiki_pages=pages, prev_draft=draft, issues=issues,
+                                     starting_draft=p.draft(sec_id))
         (drafts / f"{sec_id}.r{rnd}.md").write_text(draft, encoding="utf-8")
 
         gate_issues = run_gates(draft, ctx)
@@ -1853,6 +1921,7 @@ TEMPLATE_LINES = {
     "your notes for the introduction: what is known, what is not known, and what this study set out to do.",
 }
 BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])(?:\s+|$)")
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 DEFAULT_TITLE = "Working title"
 
 
@@ -1872,7 +1941,7 @@ def content_lines(path: Path) -> list[str]:
     if not path.is_file():
         return []
     out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in HTML_COMMENT.sub("", path.read_text(encoding="utf-8")).splitlines():
         text = BULLET.sub("", line).strip()
         if text and not text.startswith("#") and text.lower() not in TEMPLATE_LINES:
             out.append(text)
@@ -1906,6 +1975,14 @@ def _list_check(root: Path, key: str, rel: str, label: str, noun: str, hint: str
         return Check(key, rel, label, "required", False, "file is missing", hint)
     count = len(content_lines(path))
     return Check(key, rel, label, "required", count > 0, f"{count} {noun}(s)" if count else "nothing listed yet", hint)
+
+
+def _section_ids(root: Path) -> list[str]:
+    try:
+        raw = yaml.safe_load((root / "paper.yaml").read_text(encoding="utf-8")) or {}
+        return [sec["id"] for sec in raw.get("sections", []) if isinstance(sec, dict) and sec.get("id")]
+    except Exception:
+        return []
 
 
 def _has_section(root: Path, sec_id: str) -> bool:
@@ -2016,6 +2093,13 @@ def check_inputs(root: str | Path) -> list[Check]:
         pdfs = _count(root / ".papers", ("*.pdf", "*.PDF"))
         checks.append(Check("papers", ".papers/", "Source PDFs", "optional", pdfs > 0,
                             f"{pdfs} PDF(s)" if pdfs else "none", "the papers you cite, for building source pages"))
+    for sec_id in _section_ids(root):
+        draft = root / "inputs" / f"{sec_id}_draft.md"
+        if draft.is_file():
+            lines = len(content_lines(draft))
+            checks.append(Check(f"{sec_id}_draft", f"inputs/{sec_id}_draft.md", f"{sec_id.capitalize()} draft", "optional",
+                                lines > 0, f"{lines} line(s): the model starts from it" if lines else "empty: written from scratch",
+                                "your own draft, with [KEEP], [CHANGE: ...] and [WRITE: ...] marks"))
     if (root / "inputs" / "tables").is_dir():
         tables = _count(root / "inputs" / "tables", ("*.csv", "*.tsv"))
         checks.append(Check("tables", "inputs/tables/", "Result tables", "optional", tables > 0,
@@ -2042,7 +2126,7 @@ def tag(check: Check) -> tuple[str, str]:
 def line(check: Check, color: bool = False) -> str:
     word, code = tag(check)
     status = f"\033[{code}m{word:<10}\033[0m" if color else f"{word:<10}"
-    return f"  {status}{check.path:<26}{check.label:<21}{check.detail}"
+    return f"  {status}{check.path:<28}{check.label:<21}{check.detail}"
 
 
 def render(checks: list[Check], color: bool = False) -> str:
@@ -3129,6 +3213,26 @@ def test_facts_are_drafted_only_from_text_that_is_really_there(fresh):
     assert status(fresh)["facts"] is True
 
 
+def test_a_long_results_text_is_sent_in_parts_and_the_facts_are_merged(fresh, monkeypatch):
+    paragraphs = [f"Paragraph {i} reports a finding with value v{i} = {i}.{i} in the sample. " + "word " * 40
+                  for i in range(1, 9)]
+    (fresh / "inputs" / "results.md").write_text("# Results\n\n" + "\n\n".join(paragraphs), encoding="utf-8")
+    monkeypatch.setenv("PAPERKIT_CHUNK_WORDS", "100")
+    seen, said = [], []
+
+    def llm(system, user, schema):
+        seen.append(user)
+        wanted = [f"v{i} = {i}.{i}" for i in range(1, 9) if f"v{i} = {i}.{i}" in user]
+        return extract.FactList(facts=wanted)
+
+    agents.LLM = llm
+    got = extract.extract_facts(fresh, say=said.append)
+    assert len(seen) > 2 and len(said) == len(seen)                      # several short requests, each announced
+    assert max(len(u.split()) for u in seen) < 160                      # none carries the whole text
+    assert [r["text"] for r in got["rows"]] == [f"v{i} = {i}.{i}" for i in range(1, 9)]
+    assert [r["id"] for r in got["rows"]] == [f"F{i}" for i in range(1, 9)]
+
+
 def test_real_facts_and_messages_are_never_replaced_unless_forced(fresh):
     (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
     (fresh / "inputs" / "facts.csv").write_text("id,text,source\nF1,r = 0.31,Table 2\n", encoding="utf-8")
@@ -3186,6 +3290,60 @@ def test_start_screen_offers_to_draft_facts_and_messages(fresh):
     assert status(fresh)["facts"] is True and status(fresh)["key_messages"] is True
     assert any("a model drafted them" in row for row in printed)
 
+
+DRAFT_EMPTY = "<!--\nHOW TO USE\n[WRITE: an example inside the comment]\n-->\n\n## Principal findings\n\n## Limitations\n"
+DRAFT_REAL = ("<!--\nHOW TO USE\n-->\n\n## Principal findings\n\nX tracks Y ({{F1}}). [KEEP]\n\n"
+              "[WRITE: one paragraph on age differences]\n\nThis is not hedged. [CHANGE: hedge this]\n")
+
+
+def spy_on_prompts(seen):
+    def llm(system, user, schema):
+        seen.append((schema.__name__, user))
+        return dryrun.stand_in(system, user, schema)
+    return llm
+
+
+def test_default_draft_file_counts_as_empty_and_is_not_sent(fresh):
+    path = fresh / "inputs" / "discussion_draft.md"
+    path.write_text(DRAFT_EMPTY, encoding="utf-8")
+    check = next(c for c in preflight.check_inputs(fresh) if c.key == "discussion_draft")
+    assert not check.ok and "written from scratch" in check.detail and check.level == "optional"
+    assert orchestrator.Project(fresh).draft("discussion") == ""
+
+
+def test_the_starting_draft_reaches_planner_and_writer_without_its_comment(fresh):
+    fill_all(fresh)
+    (fresh / "inputs" / "discussion_draft.md").write_text(DRAFT_REAL, encoding="utf-8")
+    check = next(c for c in preflight.check_inputs(fresh) if c.key == "discussion_draft")
+    assert check.ok and "starts from it" in check.detail
+    seen = []
+    agents.LLM = spy_on_prompts(seen)
+    p = orchestrator.Project(fresh)
+    orchestrator.plan(p, "discussion")
+    assert orchestrator.approve(p, "discussion") == []
+    assert orchestrator.run_section(p, "discussion") == "DONE"
+    for name in ("ClaimList", "Draft"):
+        prompt = next(user for schema, user in seen if schema == name)
+        assert "<starting_draft>" in prompt and "[CHANGE: hedge this]" in prompt and "HOW TO USE" not in prompt
+
+
+def test_without_a_draft_file_nothing_is_added_to_the_prompts(fresh):
+    fill_all(fresh)
+    seen = []
+    agents.LLM = spy_on_prompts(seen)
+    orchestrator.plan(orchestrator.Project(fresh), "discussion")
+    assert all("starting_draft" not in user for _, user in seen)
+
+
+def test_an_action_marker_left_in_a_draft_is_blocked(fresh):
+    fill_all(fresh)
+    agents.LLM = dryrun.stand_in
+    p = orchestrator.Project(fresh)
+    table, _ = orchestrator.plan(p, "discussion")
+    draft = "## Principal findings\n\nWe observed an association ({{F1}}). [WRITE: more] <!-- C1 -->\n"
+    issues = run_gates(draft, p.ctx("discussion", table))
+    assert any(i.gate == "structure" and "Action marker" in i.message and i.excerpt == "[WRITE: more]" for i in issues)
+
 '''
 
 # ----------------------------------------------------------------------------
@@ -3200,15 +3358,20 @@ FILES['src/paperkit/nvidia.py'] = r'''
 
 Standard library only, so there is no extra dependency. Two things differ from the Anthropic path:
 - the free hosted endpoints are rate limited, so HTTP 429 and 5xx are retried after a wait;
+- the hosted gateway drops a connection that is silent for 300 s (HTTP 504), and a reasoning model
+  thinks for longer than that before a plain answer starts, so answers are streamed: bytes flow
+  while the model thinks. PAPERKIT_REASONING sets how much it thinks;
 - open models do not always honour a JSON schema, so every answer is validated here and the model
   gets a chance to repair it. Schema-guided decoding is requested first and dropped for a model
   whose endpoint rejects it.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -3218,8 +3381,11 @@ from pydantic import BaseModel, ValidationError
 BASE_URL = "https://integrate.api.nvidia.com/v1"    # override with NVIDIA_BASE_URL for a local NIM
 REPAIRS = 2                     # extra attempts when an answer does not fit the schema
 BACKOFF = (2, 5, 15, 30)        # seconds to wait after HTTP 429 or 5xx, one entry per retry
-TIMEOUT = 300
-RETRYABLE = {429, 500, 502, 503, 504}
+TIMEOUT = 300                   # seconds without any bytes from the server; PAPERKIT_TIMEOUT overrides
+STALL_RETRIES = 1               # a request that got no answer (timeout, HTTP 504, broken stream) is sent once more
+RETRYABLE = {429, 500, 502, 503}
+STALLED = ("The free endpoint is busy or this model is down: try again later, set PAPERKIT_REASONING=low, "
+           "or use another model (`paperkit ping` tests each one)")
 HINTS = {
     401: "the key was rejected: check NVIDIA_API_KEY",
     403: "this key has no access to the model",
@@ -3231,28 +3397,95 @@ _NO_GUIDED: set[str] = set()    # models whose endpoint rejected nvext.guided_js
 
 class ApiError(RuntimeError):
     def __init__(self, status: int, detail: str):
-        super().__init__(f"HTTP {status}: {detail}")
+        super().__init__(f"HTTP {status}: {detail}" if status else detail)
         self.status, self.detail = status, detail
 
 
+class Stalled(Exception):
+    """The stream ended before the model finished. The gateway does this after 300 s of silence."""
+
+
+def read_answer(response) -> dict:
+    """The answer as one chat completion, whether the server sent plain JSON or a stream of events."""
+    if "text/event-stream" not in (response.headers.get("Content-Type") or ""):
+        return json.loads(response.read().decode("utf-8"))
+    content, reasoning, finish = [], [], None
+    for raw in response:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue                                    # blank separators and ": keep-alive" comments
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            event = json.loads(payload)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("error") or (event.get("detail") and not event.get("choices")):
+            error = event.get("error") or event
+            detail = error.get("message") or error.get("detail") if isinstance(error, dict) else error
+            status = event.get("status") or (error.get("code") if isinstance(error, dict) else 0)
+            raise ApiError(int(status) if str(status).isdigit() else 0, " ".join(str(detail or event).split())[:300])
+        for choice in event.get("choices") or []:
+            delta = choice.get("delta") or {}
+            content.append(delta.get("content") or "")
+            reasoning.append(delta.get("reasoning_content") or delta.get("reasoning") or "")
+            finish = choice.get("finish_reason") or finish
+    if finish is None:
+        raise Stalled()
+    message = {"role": "assistant", "content": "".join(content), "reasoning_content": "".join(reasoning)}
+    return {"choices": [{"message": message, "finish_reason": finish}]}
+
+
+def reasoning() -> dict:
+    """Request fields for PAPERKIT_REASONING: low, high or max set how much the model thinks, off stops it.
+
+    GLM-5.3 always thinks and takes reasoning_effort (its default is max, the slowest).
+    Models with a thinking switch (GLM-4.7 to GLM-5.2 and others) take enable_thinking.
+    """
+    level = (os.environ.get("PAPERKIT_REASONING") or "").strip().lower()
+    if not level:
+        return {}
+    if level in ("off", "none", "false", "0"):
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {"reasoning_effort": level}
+
+
 def post(url: str, key: str, body: dict) -> dict:
-    """POSTs JSON and returns the decoded answer. Waits and retries on rate limits and server errors."""
+    """POSTs JSON and returns one chat completion. Retries rate limits, server errors and a request that stalled."""
     data = json.dumps(body).encode("utf-8")
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+               "Accept": "text/event-stream" if body.get("stream") else "application/json"}
+    timeout = float(os.environ.get("PAPERKIT_TIMEOUT") or TIMEOUT)
+    stalls = 0
     for wait in (*BACKOFF, None):
         request = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                return json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return read_answer(response)
         except urllib.error.HTTPError as exc:
             detail = " ".join(exc.read().decode("utf-8", "replace").split())[:300]
-            if exc.code in RETRYABLE and wait is not None:
-                asked = exc.headers.get("Retry-After", "")
-                time.sleep(min(float(asked), 60) if asked.replace(".", "", 1).isdigit() else wait)
-                continue
-            raise ApiError(exc.code, detail) from None
+            if exc.code != 504:
+                if exc.code in RETRYABLE and wait is not None:
+                    asked = exc.headers.get("Retry-After", "")
+                    time.sleep(min(float(asked), 60) if asked.replace(".", "", 1).isdigit() else wait)
+                    continue
+                raise ApiError(exc.code, detail) from None
+            why = "HTTP 504, the gateway got no answer from the model"
         except urllib.error.URLError as exc:
-            raise ApiError(0, f"cannot reach {url}: {exc.reason}") from None
+            if not isinstance(exc.reason, TimeoutError):
+                raise ApiError(0, f"cannot reach {url}: {exc.reason}") from None
+            why = f"no connection in {timeout:.0f} s"
+        except TimeoutError:
+            why = f"no bytes from the server for {timeout:.0f} s"
+        except (Stalled, ConnectionError, http.client.HTTPException):
+            why = "the answer stopped half way"
+        stalls += 1
+        if stalls > STALL_RETRIES:
+            raise ApiError(0, f"{why}, {stalls} times. {STALLED}") from None
+        print(f"  {body.get('model', 'model')}: {why}, trying once more", file=sys.stderr)
     raise ApiError(0, "no answer")      # not reached: the last round always returns or raises
 
 
@@ -3277,7 +3510,8 @@ def call(system: str, user: str, schema: type[BaseModel], model: str, max_tokens
     ]
     problem, attempts = "", 0
     while attempts <= REPAIRS:
-        body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2, "stream": False}
+        body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2,
+                "stream": os.environ.get("PAPERKIT_STREAM", "1") != "0", **reasoning()}
         guided = model not in _NO_GUIDED and os.environ.get("PAPERKIT_GUIDED_JSON", "1") != "0"
         if guided:
             body["nvext"] = {"guided_json": json_schema}
@@ -3292,7 +3526,8 @@ def call(system: str, user: str, schema: type[BaseModel], model: str, max_tokens
         choice = (data.get("choices") or [{}])[0]
         if choice.get("finish_reason") == "length":
             raise RuntimeError("Answer was cut off: raise PAPERKIT_MAX_TOKENS")
-        text = (choice.get("message") or {}).get("content") or ""
+        message = choice.get("message") or {}
+        text = message.get("content") or message.get("reasoning_content") or ""   # some servers put guided JSON there
         try:
             return schema.model_validate_json(extract_json(text))
         except ValidationError as exc:
@@ -3337,7 +3572,8 @@ SCHEMAS = {"ClaimList": ClaimList, "Draft": Draft, "Review": Review, "Ping": age
 def project(tmp_path, monkeypatch):
     """The project sits in tmp_path/repo/project; the shared .env and .gitignore are in repo/."""
     for name in ["PAPERKIT_PROVIDER", "PAPERKIT_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                 "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "PAPERKIT_GUIDED_JSON", "PAPERKIT_ENV_FILE"]:
+                 "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "PAPERKIT_GUIDED_JSON", "PAPERKIT_ENV_FILE",
+                 "PAPERKIT_REASONING", "PAPERKIT_STREAM", "PAPERKIT_TIMEOUT", "PAPERKIT_MAX_TOKENS"]:
         monkeypatch.setenv(name, "")                       # empty counts as not set, and is restored afterwards
     monkeypatch.setattr(nvidia, "BACKOFF", (0, 0))
     nvidia._NO_GUIDED.clear()
@@ -3432,7 +3668,7 @@ def test_call_sends_an_openai_request_and_parses_a_messy_answer(project, monkeyp
     assert out == Draft(markdown="Hello")
     url, key, body = seen[0]
     assert url == "https://integrate.api.nvidia.com/v1/chat/completions" and key == "nvapi-test"
-    assert body["model"] == "nvidia/some-model" and body["max_tokens"] == 123 and body["stream"] is False
+    assert body["model"] == "nvidia/some-model" and body["max_tokens"] == 123 and body["stream"] is True
     assert body["nvext"]["guided_json"]["title"] == "Draft"
     assert body["messages"][0]["role"] == "system" and body["messages"][0]["content"].startswith("SYSTEM")
     assert '"markdown"' in body["messages"][0]["content"]          # the schema is also in the prompt
@@ -3527,6 +3763,130 @@ def test_post_over_http_retries_a_rate_limit(project, monkeypatch):
         server.shutdown()
 
 
+def test_post_retries_a_read_timeout_then_gives_a_clean_error(project, monkeypatch):
+    import time
+    from http.server import ThreadingHTTPServer
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            hits.append(1)
+            if len(hits) == 1 or self.path.endswith("/never/chat/completions"):
+                time.sleep(1.5)                                  # longer than the 0.3 s timeout
+                return
+            payload = json.dumps(answer('{"markdown": "slow but fine"}')).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+        monkeypatch.setenv("PAPERKIT_TIMEOUT", "0.3")
+        monkeypatch.setenv("NVIDIA_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1/")
+        assert nvidia.call("s", "u", Draft, "nvidia/model").markdown == "slow but fine"
+        assert len(hits) == 2                                    # one timeout, one retry
+        monkeypatch.setenv("NVIDIA_BASE_URL", f"http://127.0.0.1:{server.server_port}/never/")
+        hits.clear()
+        with pytest.raises(RuntimeError, match="no bytes from the server.*2 times.*free endpoint is busy"):
+            nvidia.call("s", "u", Draft, "nvidia/model")
+        assert len(hits) == 2                                    # sent once more, then given up
+    finally:
+        server.shutdown()
+
+
+def delta(content="", reasoning="", finish=None):
+    """One event of a streamed chat completion."""
+    return {"choices": [{"delta": {"content": content, "reasoning_content": reasoning}, "finish_reason": finish}]}
+
+
+def events(*items, done=True):
+    rows = [f"data: {json.dumps(item)}\n\n" for item in items] + (["data: [DONE]\n\n"] if done else [])
+    return (": keep-alive\n\n" + "".join(rows)).encode()
+
+
+def test_answers_are_streamed_and_a_stalled_request_is_sent_only_once_more(project, monkeypatch, capsys):
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append((body, self.headers["Accept"]))
+            if self.path.startswith("/gateway/") or (self.path.startswith("/once/") and len(seen) == 1):
+                self.send_response(504)                          # what the hosted gateway sends after 300 s of silence
+                self.end_headers()
+                return
+            if not body["stream"]:
+                kind, payload = "application/json", json.dumps(answer('{"markdown": "in one piece"}')).encode()
+            elif self.path.startswith("/error/"):
+                kind, payload = "text/event-stream", events({"error": {"message": "model is overloaded", "code": 503}})
+            else:
+                cut = self.path.startswith("/cut/")              # the stream just ends: no finish_reason, no [DONE]
+                parts = [delta(reasoning="thinking {not the answer}"), delta(content='{"markdown": '),
+                         delta(content='"streamed"}')] + ([] if cut else [delta(finish="stop")])
+                kind, payload = "text/event-stream", events(*parts, done=not cut)
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def ask(base):
+        seen.clear()
+        monkeypatch.setenv("NVIDIA_BASE_URL", f"http://127.0.0.1:{server.server_port}/{base}/")
+        return nvidia.call("s", "u", Draft, "nvidia/model").markdown
+
+    try:
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+        assert ask("v1") == "streamed"                                   # pieces joined, the thinking left out
+        body, accept = seen[0]
+        assert body["stream"] is True and accept == "text/event-stream"
+        assert "reasoning_effort" not in body and "chat_template_kwargs" not in body
+
+        monkeypatch.setenv("PAPERKIT_REASONING", "low")
+        assert ask("v1") == "streamed" and seen[0][0]["reasoning_effort"] == "low"
+        monkeypatch.setenv("PAPERKIT_REASONING", "off")
+        assert ask("v1") == "streamed" and seen[0][0]["chat_template_kwargs"] == {"enable_thinking": False}
+        assert "reasoning_effort" not in seen[0][0]
+        monkeypatch.setenv("PAPERKIT_REASONING", "")
+
+        monkeypatch.setenv("PAPERKIT_STREAM", "0")
+        assert ask("v1") == "in one piece" and seen[0] == (seen[0][0], "application/json")
+        assert seen[0][0]["stream"] is False
+        monkeypatch.setenv("PAPERKIT_STREAM", "")
+
+        assert ask("once") == "streamed" and len(seen) == 2              # one 504, then the answer
+        assert "trying once more" in capsys.readouterr().err
+        with pytest.raises(RuntimeError, match="HTTP 504.*2 times.*PAPERKIT_REASONING=low"):
+            ask("gateway")
+        assert len(seen) == 2                                            # not five rounds of five minutes
+        with pytest.raises(RuntimeError, match="the answer stopped half way, 2 times"):
+            ask("cut")
+        with pytest.raises(RuntimeError, match="HTTP 503: model is overloaded"):
+            ask("error")
+    finally:
+        server.shutdown()
+
+
+def test_json_that_arrives_in_the_reasoning_field_is_still_read(project, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    reply = {"choices": [{"message": {"content": "", "reasoning_content": '{"markdown": "from reasoning"}'},
+                          "finish_reason": "stop"}]}
+    monkeypatch.setattr(nvidia, "post", lambda url, key, body: reply)
+    assert nvidia.call("s", "u", Draft, "nvidia/model").markdown == "from reasoning"
+
+
 # ----------------------------------------- the whole pipeline through nvidia
 
 def test_pipeline_runs_through_the_nvidia_provider(project, monkeypatch):
@@ -3554,7 +3914,7 @@ def test_ping_reports_each_model(project, monkeypatch, capsys):
     monkeypatch.setattr(nvidia, "post", stand_in_endpoint([]))
     assert main(["--root", str(project), "ping"]) == 0
     out = capsys.readouterr().out
-    assert "(planner, writer): ok" in out and "other/model  (reviewer): ok" in out
+    assert "(planner, writer, facts): ok" in out and "other/model  (reviewer): ok" in out
 
     def refuse(url, key, body):
         raise nvidia.ApiError(401, "Unauthorized")
@@ -3589,6 +3949,7 @@ unless `force` is set. Nothing is approved here: a person reads the result, as w
 from __future__ import annotations
 
 import csv
+import os
 import re
 from pathlib import Path
 
@@ -3677,15 +4038,34 @@ def _ask(root: Path, kind: str, system: str, user: str, schema: type[BaseModel])
     return agents._ask(kind, system, user, schema)
 
 
-def extract_facts(root: str | Path, force: bool = False) -> dict:
-    """inputs/facts.csv and facts/facts.json from the Results and Methods text."""
+def _chunks(text: str, limit: int) -> list[str]:
+    """The text cut between paragraphs into pieces of about `limit` words, so no request is long."""
+    pieces, current, size = [], [], 0
+    for block in re.split(r"\n\s*\n", text):
+        words = len(block.split())
+        if current and size + words > limit:
+            pieces.append("\n\n".join(current))
+            current, size = [], 0
+        current.append(block)
+        size += words
+    if current:
+        pieces.append("\n\n".join(current))
+    return [p for p in pieces if p.strip()]
+
+
+def extract_facts(root: str | Path, force: bool = False, say=lambda text: None) -> dict:
+    """inputs/facts.csv and facts/facts.json from the Results and Methods text, a few paragraphs per request."""
     root = Path(root)
     if not force and not facts_are_default(root):
         raise Skip("inputs/facts.csv already has facts (repeat with --force to replace them)")
     _results(root)
     texts = {name: _read(root, name) for name, _ in SOURCES}
-    user = "\n\n".join(agents._tag(name, texts[name]) for name, _ in SOURCES)
-    proposed = _ask(root, "facts", FACTS, user, FactList).facts
+    limit = int(os.environ.get("PAPERKIT_CHUNK_WORDS") or "500")
+    pieces = [(name, piece) for name, _ in SOURCES for piece in _chunks(texts[name], limit)]
+    proposed = []
+    for number, (name, piece) in enumerate(pieces, 1):
+        say(f"facts: part {number} of {len(pieces)} ({name}, {len(piece.split())} words)")
+        proposed += _ask(root, "facts", FACTS, agents._tag(name, piece), FactList).facts
     rows, dropped, seen = [], [], set()
     for raw in proposed:
         text = _norm(raw)
@@ -3750,7 +4130,7 @@ def run(root: str | Path, what: str = "all", force: bool = False, out=print) -> 
     root, code = Path(root), 0
     if what in ("all", "facts"):
         try:
-            got = extract_facts(root, force)
+            got = extract_facts(root, force, out)
             out(f"facts: {len(got['rows'])} -> inputs/facts.csv and facts/facts.json")
             for r in got["rows"]:
                 out(f"  {r['id']:<5}{r['text']}   ({r['source']})")
@@ -3792,6 +4172,10 @@ ANTHROPIC_API_KEY=
 # Optional: one provider and model for every agent, instead of config/models.yaml
 # PAPERKIT_PROVIDER=nvidia
 # PAPERKIT_MODEL=z-ai/glm-5.3
+
+# Optional, NVIDIA only: how much a reasoning model thinks (low, high, max, or off). Low is the fastest.
+# PAPERKIT_REASONING=low
+# PAPERKIT_MAX_TOKENS=16000
 """
 
 # Repository-wide ignore rules. A rule without a leading slash applies at any depth.
@@ -3799,7 +4183,7 @@ IGNORE_RULES = [
     ".env", ".venv/", "__pycache__/", "*.egg-info/", ".pytest_cache/",
     ".DS_Store", "Thumbs.db", "~$*",
     "build/", "state/log/", ".papers/", ".writing_guides/", ".cache/",
-    "inputs/", "drafts/", "state/", "facts/", 
+    "inputs/", "drafts/", "state/", "facts/",                # your inputs and everything the pipeline writes
 ]
 
 

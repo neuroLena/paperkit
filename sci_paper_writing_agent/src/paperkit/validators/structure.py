@@ -1,8 +1,12 @@
-"""Structure: required headings in order, and the word limit."""
+"""Structure: required headings in order, the word limit, and no action marker left over."""
 from __future__ import annotations
 
+import re
+
 from ..schemas import Issue
-from .common import GateContext, headings, plain
+from .common import GateContext, headings, plain, short
+
+ACTION = re.compile(r"\[(?:WRITE|CHANGE)\b[^\]]*\]|\[KEEP\]")   # marks from inputs/<section>_draft.md
 
 
 def check(draft: str, ctx: GateContext) -> list[Issue]:
@@ -20,6 +24,8 @@ def check(draft: str, ctx: GateContext) -> list[Issue]:
     extra = [h for h in found if h not in ctx.sec.required_headings]
     if ctx.sec.required_headings and extra:
         issues.append(Issue(gate="structure", message=f"Headings not in the spec: {extra}"))
+    for m in ACTION.finditer(draft):
+        issues.append(Issue(gate="structure", message="Action marker left in the draft", excerpt=short(m.group(0))))
     words = len(plain(draft).split())
     if words == 0:
         issues.append(Issue(gate="structure", message="Draft is empty"))

@@ -30,6 +30,7 @@ TEMPLATE_LINES = {
     "your notes for the introduction: what is known, what is not known, and what this study set out to do.",
 }
 BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])(?:\s+|$)")
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 DEFAULT_TITLE = "Working title"
 
 
@@ -49,7 +50,7 @@ def content_lines(path: Path) -> list[str]:
     if not path.is_file():
         return []
     out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in HTML_COMMENT.sub("", path.read_text(encoding="utf-8")).splitlines():
         text = BULLET.sub("", line).strip()
         if text and not text.startswith("#") and text.lower() not in TEMPLATE_LINES:
             out.append(text)
@@ -83,6 +84,14 @@ def _list_check(root: Path, key: str, rel: str, label: str, noun: str, hint: str
         return Check(key, rel, label, "required", False, "file is missing", hint)
     count = len(content_lines(path))
     return Check(key, rel, label, "required", count > 0, f"{count} {noun}(s)" if count else "nothing listed yet", hint)
+
+
+def _section_ids(root: Path) -> list[str]:
+    try:
+        raw = yaml.safe_load((root / "paper.yaml").read_text(encoding="utf-8")) or {}
+        return [sec["id"] for sec in raw.get("sections", []) if isinstance(sec, dict) and sec.get("id")]
+    except Exception:
+        return []
 
 
 def _has_section(root: Path, sec_id: str) -> bool:
@@ -193,6 +202,13 @@ def check_inputs(root: str | Path) -> list[Check]:
         pdfs = _count(root / ".papers", ("*.pdf", "*.PDF"))
         checks.append(Check("papers", ".papers/", "Source PDFs", "optional", pdfs > 0,
                             f"{pdfs} PDF(s)" if pdfs else "none", "the papers you cite, for building source pages"))
+    for sec_id in _section_ids(root):
+        draft = root / "inputs" / f"{sec_id}_draft.md"
+        if draft.is_file():
+            lines = len(content_lines(draft))
+            checks.append(Check(f"{sec_id}_draft", f"inputs/{sec_id}_draft.md", f"{sec_id.capitalize()} draft", "optional",
+                                lines > 0, f"{lines} line(s): the model starts from it" if lines else "empty: written from scratch",
+                                "your own draft, with [KEEP], [CHANGE: ...] and [WRITE: ...] marks"))
     if (root / "inputs" / "tables").is_dir():
         tables = _count(root / "inputs" / "tables", ("*.csv", "*.tsv"))
         checks.append(Check("tables", "inputs/tables/", "Result tables", "optional", tables > 0,
@@ -219,7 +235,7 @@ def tag(check: Check) -> tuple[str, str]:
 def line(check: Check, color: bool = False) -> str:
     word, code = tag(check)
     status = f"\033[{code}m{word:<10}\033[0m" if color else f"{word:<10}"
-    return f"  {status}{check.path:<26}{check.label:<21}{check.detail}"
+    return f"  {status}{check.path:<28}{check.label:<21}{check.detail}"
 
 
 def render(checks: list[Check], color: bool = False) -> str:

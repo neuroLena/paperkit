@@ -13,6 +13,7 @@ import yaml
 from . import agents, facts, wiki, zotero
 from .schemas import ClaimTable, Issue, PaperSpec
 from .validators import GateContext, blocking, check_claims, run_gates
+from .validators.common import COMMENT
 
 
 def _dump(path: Path, obj) -> None:
@@ -38,6 +39,14 @@ class Project:
     def inp(self, name: str) -> str:
         path = self.root / "inputs" / f"{name}.md"
         return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def draft(self, sec_id: str) -> str:
+        """The author's own starting draft, inputs/<section>_draft.md, without its explanatory comment.
+
+        Empty when the file holds nothing but headings, so the default file changes nothing.
+        """
+        text = COMMENT.sub("", self.inp(f"{sec_id}_draft")).strip()
+        return text if any(row.strip() and not row.lstrip().startswith("#") for row in text.splitlines()) else ""
 
     def claims_path(self, sec_id: str) -> Path:
         return self.root / "state" / "claims" / f"{sec_id}.json"
@@ -71,6 +80,7 @@ def plan(p: Project, sec_id: str) -> tuple[ClaimTable, list[Issue]]:
         claims = agents.plan_claims(
             sec, design=p.spec.design, key_messages=p.inp("key_messages"), limitations=p.inp("limitations"),
             methods=p.inp("methods"), results=p.inp("results"), introduction=p.inp("introduction"), fact_reg=p.facts,
+            starting_draft=p.draft(sec_id),
             library=zotero.library_listing(p.bib), wiki_index=wiki.index(p.root / "wiki"), issues=issues)
         table = ClaimTable(section_id=sec_id, approved=False, claims=claims)
         issues = blocking(check_claims(table, p.facts, set(p.bib)))
@@ -114,7 +124,8 @@ def run_section(p: Project, sec_id: str) -> str:
     draft, issues = "", []
     for rnd in range(1, p.spec.max_rounds + 1):
         draft = agents.write_section(sec, design=p.spec.design, claims=table.claims, fact_reg=fact_sub,
-                                     wiki_pages=pages, prev_draft=draft, issues=issues)
+                                     wiki_pages=pages, prev_draft=draft, issues=issues,
+                                     starting_draft=p.draft(sec_id))
         (drafts / f"{sec_id}.r{rnd}.md").write_text(draft, encoding="utf-8")
 
         gate_issues = run_gates(draft, ctx)

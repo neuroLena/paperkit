@@ -110,7 +110,7 @@ class Ping(BaseModel):
 def ping_all() -> list[tuple[str, str, str, str]]:
     """One tiny request per distinct provider and model in use: (agents, provider, model, 'ok' or the error)."""
     routes: dict[tuple[str, str], list[str]] = {}
-    for kind in PIPELINE_AGENTS:
+    for kind in (*PIPELINE_AGENTS, "facts"):             # facts: the model behind `paperkit extract facts`
         routes.setdefault(route(kind), []).append(kind)
     rows = []
     for (provider, model), kinds in routes.items():
@@ -164,12 +164,13 @@ Rules:
 - Cover every required heading. In the Discussion, also cover every key message.
 - In the Introduction (section id "introduction"), take the background, the knowledge gap and the aim from <introduction_notes>. State no result of this study and use no OBSERVED claim there. A statement about earlier work is INFERRED, with its cite_keys, and any number in it comes from a fact id.
 - Respect the stated limitations.
-- Do not claim more than the results support."""
+- Do not claim more than the results support.
+- If <starting_draft> is given, it is the author's own draft of this section. Build the claims from it: one claim per statement the author made, in the author's order, with the author's meaning. Text marked [KEEP] is final: keep its claims as they are. At [CHANGE: ...] make that change. At [WRITE: ...] add the claims it asks for, from the results and facts. Drop an author's statement only if the results contradict it; then keep the claim and add "CONTRADICTS: what" to its assumptions."""
 
 
 def plan_claims(sec: SectionSpec, *, design: str, key_messages: str, limitations: str, methods: str,
                 results: str, fact_reg: dict, library: str, wiki_index: str,
-                issues: Sequence[Issue] = (), introduction: str = "") -> list[Claim]:
+                issues: Sequence[Issue] = (), introduction: str = "", starting_draft: str = "") -> list[Claim]:
     user = "\n\n".join([
         _tag("section", _json(sec.model_dump())),
         _tag("study_design", design),
@@ -182,6 +183,8 @@ def plan_claims(sec: SectionSpec, *, design: str, key_messages: str, limitations
         _tag("library", library),
         _tag("wiki_index", wiki_index),
     ])
+    if starting_draft:
+        user += "\n\n" + _tag("starting_draft", starting_draft)
     if issues:
         user += "\n\n" + _tag("problems_in_your_previous_table", _issues(issues))
     return _ask("planner", PLANNER, user, ClaimList).claims
@@ -202,14 +205,16 @@ Code checks the draft and rejects it on any violation:
   ASSUMED: say "this assumes that ..." and whether it was tested.
   SPECULATIVE: "may", "might", "one possibility is".
 - No "novel", "first", "proves", "clearly", "robust". Never "no effect": say "we did not detect".
-- If something you need is missing, write [AUTHOR: what is missing] or [NEEDS SOURCE: what for]. Do not fill the gap yourself."""
+- If something you need is missing, write [AUTHOR: what is missing] or [NEEDS SOURCE: what for]. Do not fill the gap yourself.
+- If <starting_draft> is given, follow it: keep text marked [KEEP] word for word (it still needs its claim tag), make the change at each [CHANGE: ...], and write each [WRITE: ...] from the claims. Never copy the markers [KEEP], [CHANGE: ...] or [WRITE: ...] into your draft."""
 
 OBSERVATIONAL = """
 - The design is observational: no causal wording (cause, lead to, result in, effect of, impact, drive) outside paragraphs tagged only with SPECULATIVE or ASSUMED claims."""
 
 
 def write_section(sec: SectionSpec, *, design: str, claims: Sequence[Claim], fact_reg: dict,
-                  wiki_pages: dict[str, str], prev_draft: str = "", issues: Sequence[Issue] = ()) -> str:
+                  wiki_pages: dict[str, str], prev_draft: str = "", issues: Sequence[Issue] = (),
+                  starting_draft: str = "") -> str:
     system = WRITER + (OBSERVATIONAL if design == "observational" else "")
     user = "\n\n".join([
         _tag("section", _json(sec.model_dump())),
@@ -217,6 +222,8 @@ def write_section(sec: SectionSpec, *, design: str, claims: Sequence[Claim], fac
         _tag("facts", _json(fact_reg)),
         _tag("sources", "\n\n".join(f"## {k}\n{v}" for k, v in wiki_pages.items())),
     ])
+    if starting_draft:
+        user += "\n\n" + _tag("starting_draft", starting_draft)
     if prev_draft:
         user += "\n\n" + _tag("previous_draft", prev_draft)
         user += "\n\n" + _tag("problems_to_fix", _issues(issues))

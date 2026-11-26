@@ -26,7 +26,8 @@ SCHEMAS = {"ClaimList": ClaimList, "Draft": Draft, "Review": Review, "Ping": age
 def project(tmp_path, monkeypatch):
     """The project sits in tmp_path/repo/project; the shared .env and .gitignore are in repo/."""
     for name in ["PAPERKIT_PROVIDER", "PAPERKIT_MODEL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-                 "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "PAPERKIT_GUIDED_JSON", "PAPERKIT_ENV_FILE"]:
+                 "NVIDIA_API_KEY", "NVIDIA_BASE_URL", "PAPERKIT_GUIDED_JSON", "PAPERKIT_ENV_FILE",
+                 "PAPERKIT_REASONING", "PAPERKIT_STREAM", "PAPERKIT_TIMEOUT", "PAPERKIT_MAX_TOKENS"]:
         monkeypatch.setenv(name, "")                       # empty counts as not set, and is restored afterwards
     monkeypatch.setattr(nvidia, "BACKOFF", (0, 0))
     nvidia._NO_GUIDED.clear()
@@ -121,7 +122,7 @@ def test_call_sends_an_openai_request_and_parses_a_messy_answer(project, monkeyp
     assert out == Draft(markdown="Hello")
     url, key, body = seen[0]
     assert url == "https://integrate.api.nvidia.com/v1/chat/completions" and key == "nvapi-test"
-    assert body["model"] == "nvidia/some-model" and body["max_tokens"] == 123 and body["stream"] is False
+    assert body["model"] == "nvidia/some-model" and body["max_tokens"] == 123 and body["stream"] is True
     assert body["nvext"]["guided_json"]["title"] == "Draft"
     assert body["messages"][0]["role"] == "system" and body["messages"][0]["content"].startswith("SYSTEM")
     assert '"markdown"' in body["messages"][0]["content"]          # the schema is also in the prompt
@@ -216,6 +217,130 @@ def test_post_over_http_retries_a_rate_limit(project, monkeypatch):
         server.shutdown()
 
 
+def test_post_retries_a_read_timeout_then_gives_a_clean_error(project, monkeypatch):
+    import time
+    from http.server import ThreadingHTTPServer
+    hits = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            hits.append(1)
+            if len(hits) == 1 or self.path.endswith("/never/chat/completions"):
+                time.sleep(1.5)                                  # longer than the 0.3 s timeout
+                return
+            payload = json.dumps(answer('{"markdown": "slow but fine"}')).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+        monkeypatch.setenv("PAPERKIT_TIMEOUT", "0.3")
+        monkeypatch.setenv("NVIDIA_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1/")
+        assert nvidia.call("s", "u", Draft, "nvidia/model").markdown == "slow but fine"
+        assert len(hits) == 2                                    # one timeout, one retry
+        monkeypatch.setenv("NVIDIA_BASE_URL", f"http://127.0.0.1:{server.server_port}/never/")
+        hits.clear()
+        with pytest.raises(RuntimeError, match="no bytes from the server.*2 times.*free endpoint is busy"):
+            nvidia.call("s", "u", Draft, "nvidia/model")
+        assert len(hits) == 2                                    # sent once more, then given up
+    finally:
+        server.shutdown()
+
+
+def delta(content="", reasoning="", finish=None):
+    """One event of a streamed chat completion."""
+    return {"choices": [{"delta": {"content": content, "reasoning_content": reasoning}, "finish_reason": finish}]}
+
+
+def events(*items, done=True):
+    rows = [f"data: {json.dumps(item)}\n\n" for item in items] + (["data: [DONE]\n\n"] if done else [])
+    return (": keep-alive\n\n" + "".join(rows)).encode()
+
+
+def test_answers_are_streamed_and_a_stalled_request_is_sent_only_once_more(project, monkeypatch, capsys):
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append((body, self.headers["Accept"]))
+            if self.path.startswith("/gateway/") or (self.path.startswith("/once/") and len(seen) == 1):
+                self.send_response(504)                          # what the hosted gateway sends after 300 s of silence
+                self.end_headers()
+                return
+            if not body["stream"]:
+                kind, payload = "application/json", json.dumps(answer('{"markdown": "in one piece"}')).encode()
+            elif self.path.startswith("/error/"):
+                kind, payload = "text/event-stream", events({"error": {"message": "model is overloaded", "code": 503}})
+            else:
+                cut = self.path.startswith("/cut/")              # the stream just ends: no finish_reason, no [DONE]
+                parts = [delta(reasoning="thinking {not the answer}"), delta(content='{"markdown": '),
+                         delta(content='"streamed"}')] + ([] if cut else [delta(finish="stop")])
+                kind, payload = "text/event-stream", events(*parts, done=not cut)
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def ask(base):
+        seen.clear()
+        monkeypatch.setenv("NVIDIA_BASE_URL", f"http://127.0.0.1:{server.server_port}/{base}/")
+        return nvidia.call("s", "u", Draft, "nvidia/model").markdown
+
+    try:
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+        assert ask("v1") == "streamed"                                   # pieces joined, the thinking left out
+        body, accept = seen[0]
+        assert body["stream"] is True and accept == "text/event-stream"
+        assert "reasoning_effort" not in body and "chat_template_kwargs" not in body
+
+        monkeypatch.setenv("PAPERKIT_REASONING", "low")
+        assert ask("v1") == "streamed" and seen[0][0]["reasoning_effort"] == "low"
+        monkeypatch.setenv("PAPERKIT_REASONING", "off")
+        assert ask("v1") == "streamed" and seen[0][0]["chat_template_kwargs"] == {"enable_thinking": False}
+        assert "reasoning_effort" not in seen[0][0]
+        monkeypatch.setenv("PAPERKIT_REASONING", "")
+
+        monkeypatch.setenv("PAPERKIT_STREAM", "0")
+        assert ask("v1") == "in one piece" and seen[0] == (seen[0][0], "application/json")
+        assert seen[0][0]["stream"] is False
+        monkeypatch.setenv("PAPERKIT_STREAM", "")
+
+        assert ask("once") == "streamed" and len(seen) == 2              # one 504, then the answer
+        assert "trying once more" in capsys.readouterr().err
+        with pytest.raises(RuntimeError, match="HTTP 504.*2 times.*PAPERKIT_REASONING=low"):
+            ask("gateway")
+        assert len(seen) == 2                                            # not five rounds of five minutes
+        with pytest.raises(RuntimeError, match="the answer stopped half way, 2 times"):
+            ask("cut")
+        with pytest.raises(RuntimeError, match="HTTP 503: model is overloaded"):
+            ask("error")
+    finally:
+        server.shutdown()
+
+
+def test_json_that_arrives_in_the_reasoning_field_is_still_read(project, monkeypatch):
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    reply = {"choices": [{"message": {"content": "", "reasoning_content": '{"markdown": "from reasoning"}'},
+                          "finish_reason": "stop"}]}
+    monkeypatch.setattr(nvidia, "post", lambda url, key, body: reply)
+    assert nvidia.call("s", "u", Draft, "nvidia/model").markdown == "from reasoning"
+
+
 # ----------------------------------------- the whole pipeline through nvidia
 
 def test_pipeline_runs_through_the_nvidia_provider(project, monkeypatch):
@@ -243,7 +368,7 @@ def test_ping_reports_each_model(project, monkeypatch, capsys):
     monkeypatch.setattr(nvidia, "post", stand_in_endpoint([]))
     assert main(["--root", str(project), "ping"]) == 0
     out = capsys.readouterr().out
-    assert "(planner, writer): ok" in out and "other/model  (reviewer): ok" in out
+    assert "(planner, writer, facts): ok" in out and "other/model  (reviewer): ok" in out
 
     def refuse(url, key, body):
         raise nvidia.ApiError(401, "Unauthorized")

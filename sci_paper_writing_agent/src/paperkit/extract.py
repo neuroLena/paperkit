@@ -8,6 +8,7 @@ unless `force` is set. Nothing is approved here: a person reads the result, as w
 from __future__ import annotations
 
 import csv
+import os
 import re
 from pathlib import Path
 
@@ -96,15 +97,34 @@ def _ask(root: Path, kind: str, system: str, user: str, schema: type[BaseModel])
     return agents._ask(kind, system, user, schema)
 
 
-def extract_facts(root: str | Path, force: bool = False) -> dict:
-    """inputs/facts.csv and facts/facts.json from the Results and Methods text."""
+def _chunks(text: str, limit: int) -> list[str]:
+    """The text cut between paragraphs into pieces of about `limit` words, so no request is long."""
+    pieces, current, size = [], [], 0
+    for block in re.split(r"\n\s*\n", text):
+        words = len(block.split())
+        if current and size + words > limit:
+            pieces.append("\n\n".join(current))
+            current, size = [], 0
+        current.append(block)
+        size += words
+    if current:
+        pieces.append("\n\n".join(current))
+    return [p for p in pieces if p.strip()]
+
+
+def extract_facts(root: str | Path, force: bool = False, say=lambda text: None) -> dict:
+    """inputs/facts.csv and facts/facts.json from the Results and Methods text, a few paragraphs per request."""
     root = Path(root)
     if not force and not facts_are_default(root):
         raise Skip("inputs/facts.csv already has facts (repeat with --force to replace them)")
     _results(root)
     texts = {name: _read(root, name) for name, _ in SOURCES}
-    user = "\n\n".join(agents._tag(name, texts[name]) for name, _ in SOURCES)
-    proposed = _ask(root, "facts", FACTS, user, FactList).facts
+    limit = int(os.environ.get("PAPERKIT_CHUNK_WORDS") or "500")
+    pieces = [(name, piece) for name, _ in SOURCES for piece in _chunks(texts[name], limit)]
+    proposed = []
+    for number, (name, piece) in enumerate(pieces, 1):
+        say(f"facts: part {number} of {len(pieces)} ({name}, {len(piece.split())} words)")
+        proposed += _ask(root, "facts", FACTS, agents._tag(name, piece), FactList).facts
     rows, dropped, seen = [], [], set()
     for raw in proposed:
         text = _norm(raw)
@@ -169,7 +189,7 @@ def run(root: str | Path, what: str = "all", force: bool = False, out=print) -> 
     root, code = Path(root), 0
     if what in ("all", "facts"):
         try:
-            got = extract_facts(root, force)
+            got = extract_facts(root, force, out)
             out(f"facts: {len(got['rows'])} -> inputs/facts.csv and facts/facts.json")
             for r in got["rows"]:
                 out(f"  {r['id']:<5}{r['text']}   ({r['source']})")

@@ -314,6 +314,26 @@ def test_facts_are_drafted_only_from_text_that_is_really_there(fresh):
     assert status(fresh)["facts"] is True
 
 
+def test_a_long_results_text_is_sent_in_parts_and_the_facts_are_merged(fresh, monkeypatch):
+    paragraphs = [f"Paragraph {i} reports a finding with value v{i} = {i}.{i} in the sample. " + "word " * 40
+                  for i in range(1, 9)]
+    (fresh / "inputs" / "results.md").write_text("# Results\n\n" + "\n\n".join(paragraphs), encoding="utf-8")
+    monkeypatch.setenv("PAPERKIT_CHUNK_WORDS", "100")
+    seen, said = [], []
+
+    def llm(system, user, schema):
+        seen.append(user)
+        wanted = [f"v{i} = {i}.{i}" for i in range(1, 9) if f"v{i} = {i}.{i}" in user]
+        return extract.FactList(facts=wanted)
+
+    agents.LLM = llm
+    got = extract.extract_facts(fresh, say=said.append)
+    assert len(seen) > 2 and len(said) == len(seen)                      # several short requests, each announced
+    assert max(len(u.split()) for u in seen) < 160                      # none carries the whole text
+    assert [r["text"] for r in got["rows"]] == [f"v{i} = {i}.{i}" for i in range(1, 9)]
+    assert [r["id"] for r in got["rows"]] == [f"F{i}" for i in range(1, 9)]
+
+
 def test_real_facts_and_messages_are_never_replaced_unless_forced(fresh):
     (fresh / "inputs" / "results.md").write_text(RESULTS_TEXT, encoding="utf-8")
     (fresh / "inputs" / "facts.csv").write_text("id,text,source\nF1,r = 0.31,Table 2\n", encoding="utf-8")
@@ -370,4 +390,58 @@ def test_start_screen_offers_to_draft_facts_and_messages(fresh):
     wizard.fill(ui, fresh, checks["key_messages"])
     assert status(fresh)["facts"] is True and status(fresh)["key_messages"] is True
     assert any("a model drafted them" in row for row in printed)
+
+
+DRAFT_EMPTY = "<!--\nHOW TO USE\n[WRITE: an example inside the comment]\n-->\n\n## Principal findings\n\n## Limitations\n"
+DRAFT_REAL = ("<!--\nHOW TO USE\n-->\n\n## Principal findings\n\nX tracks Y ({{F1}}). [KEEP]\n\n"
+              "[WRITE: one paragraph on age differences]\n\nThis is not hedged. [CHANGE: hedge this]\n")
+
+
+def spy_on_prompts(seen):
+    def llm(system, user, schema):
+        seen.append((schema.__name__, user))
+        return dryrun.stand_in(system, user, schema)
+    return llm
+
+
+def test_default_draft_file_counts_as_empty_and_is_not_sent(fresh):
+    path = fresh / "inputs" / "discussion_draft.md"
+    path.write_text(DRAFT_EMPTY, encoding="utf-8")
+    check = next(c for c in preflight.check_inputs(fresh) if c.key == "discussion_draft")
+    assert not check.ok and "written from scratch" in check.detail and check.level == "optional"
+    assert orchestrator.Project(fresh).draft("discussion") == ""
+
+
+def test_the_starting_draft_reaches_planner_and_writer_without_its_comment(fresh):
+    fill_all(fresh)
+    (fresh / "inputs" / "discussion_draft.md").write_text(DRAFT_REAL, encoding="utf-8")
+    check = next(c for c in preflight.check_inputs(fresh) if c.key == "discussion_draft")
+    assert check.ok and "starts from it" in check.detail
+    seen = []
+    agents.LLM = spy_on_prompts(seen)
+    p = orchestrator.Project(fresh)
+    orchestrator.plan(p, "discussion")
+    assert orchestrator.approve(p, "discussion") == []
+    assert orchestrator.run_section(p, "discussion") == "DONE"
+    for name in ("ClaimList", "Draft"):
+        prompt = next(user for schema, user in seen if schema == name)
+        assert "<starting_draft>" in prompt and "[CHANGE: hedge this]" in prompt and "HOW TO USE" not in prompt
+
+
+def test_without_a_draft_file_nothing_is_added_to_the_prompts(fresh):
+    fill_all(fresh)
+    seen = []
+    agents.LLM = spy_on_prompts(seen)
+    orchestrator.plan(orchestrator.Project(fresh), "discussion")
+    assert all("starting_draft" not in user for _, user in seen)
+
+
+def test_an_action_marker_left_in_a_draft_is_blocked(fresh):
+    fill_all(fresh)
+    agents.LLM = dryrun.stand_in
+    p = orchestrator.Project(fresh)
+    table, _ = orchestrator.plan(p, "discussion")
+    draft = "## Principal findings\n\nWe observed an association ({{F1}}). [WRITE: more] <!-- C1 -->\n"
+    issues = run_gates(draft, p.ctx("discussion", table))
+    assert any(i.gate == "structure" and "Action marker" in i.message and i.excerpt == "[WRITE: more]" for i in issues)
 
