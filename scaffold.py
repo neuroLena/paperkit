@@ -1325,6 +1325,7 @@ NEW -> AWAITING_APPROVAL (or CLAIMS_INVALID) -> APPROVED -> DONE (or ESCALATED)
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import yaml
@@ -1390,12 +1391,35 @@ class Project:
                            facts=self.facts, bib_keys=set(self.bib))
 
 
-def plan(p: Project, sec_id: str) -> tuple[ClaimTable, list[Issue]]:
-    """Planner -> claim table. The claims gate sends its errors back to the planner."""
+def _quiet(text: str = "") -> None:
+    """The default `say`: nothing is reported."""
+
+
+def _model(kind: str) -> str:
+    return "stand-in model" if agents.LLM else agents.route(kind)[1]
+
+
+def _next(rnd: int, rounds: int, who: str) -> str:
+    return f"back to the {who}" if rnd < rounds else "no rounds left"
+
+
+def _list(say, issues: list[Issue], limit: int = 5) -> None:
+    for issue in issues[:limit]:
+        say(f"           [{issue.gate}] {' '.join(issue.message.split())[:160]}")
+    if len(issues) > limit:
+        say(f"           ... and {len(issues) - limit} more")
+
+
+def plan(p: Project, sec_id: str, say=_quiet) -> tuple[ClaimTable, list[Issue]]:
+    """Planner -> claim table. The claims gate sends its errors back to the planner. `say` gets a line per stage."""
     sec = p.spec.section(sec_id)
     issues: list[Issue] = []
     table = ClaimTable(section_id=sec_id, claims=[])
-    for _ in range(p.spec.max_rounds):
+    rounds = p.spec.max_rounds
+    for rnd in range(1, rounds + 1):
+        say(f"{sec_id}: planning, round {rnd} of {rounds}")
+        say(f"  planner  {_model('planner')} is building the claim table ...")
+        started = time.monotonic()
         claims = agents.plan_claims(
             sec, design=p.spec.design, key_messages=p.inp("key_messages"), limitations=p.inp("limitations"),
             methods=p.inp("methods"), results=p.inp("results"), introduction=p.inp("introduction"), fact_reg=p.facts,
@@ -1403,8 +1427,12 @@ def plan(p: Project, sec_id: str) -> tuple[ClaimTable, list[Issue]]:
             library=zotero.library_listing(p.bib), wiki_index=wiki.index(p.root / "wiki"), issues=issues)
         table = ClaimTable(section_id=sec_id, approved=False, claims=claims)
         issues = blocking(check_claims(table, p.facts, set(p.bib)))
+        say(f"  planner  done in {time.monotonic() - started:.0f} s: {len(claims)} claims")
         if not issues:
+            say("  check    passed")
             break
+        say(f"  check    {len(issues)} problem(s), {_next(rnd, rounds, 'planner')}:")
+        _list(say, issues)
     p.save_claims(table)
     p.set_status(sec_id, "CLAIMS_INVALID" if issues else "AWAITING_APPROVAL")
     return table, issues
@@ -1423,15 +1451,17 @@ def approve(p: Project, sec_id: str) -> list[Issue]:
     return issues
 
 
-def run_section(p: Project, sec_id: str) -> str:
-    """Writer -> gates -> reviewer, until clean or until the rounds run out."""
+def run_section(p: Project, sec_id: str, say=_quiet) -> str:
+    """Writer -> gates -> reviewer, until clean or until the rounds run out. `say` gets a line per stage."""
     sec = p.spec.section(sec_id)
     table = p.load_claims(sec_id)
     if table is None:
-        table, _ = plan(p, sec_id)
+        table, _ = plan(p, sec_id, say)
     if blocking(check_claims(table, p.facts, set(p.bib))):
+        say(f"{sec_id}: the claim table has errors, nothing was written")
         return p.set_status(sec_id, "CLAIMS_INVALID")
     if not table.approved:
+        say(f"{sec_id}: the claim table is not approved yet, nothing was written")
         return p.set_status(sec_id, "AWAITING_APPROVAL")
 
     ctx = p.ctx(sec_id, table)
@@ -1440,34 +1470,49 @@ def run_section(p: Project, sec_id: str) -> str:
     drafts, reviews = p.root / "drafts", p.root / "state" / "reviews"
     drafts.mkdir(parents=True, exist_ok=True)
 
-    draft, issues = "", []
-    for rnd in range(1, p.spec.max_rounds + 1):
+    draft, issues, rounds = "", [], p.spec.max_rounds
+    for rnd in range(1, rounds + 1):
+        say(f"{sec_id}: round {rnd} of {rounds}")
+        say(f"  writer   {_model('writer')} is writing the draft ...")
+        started = time.monotonic()
         draft = agents.write_section(sec, design=p.spec.design, claims=table.claims, fact_reg=fact_sub,
                                      wiki_pages=pages, prev_draft=draft, issues=issues,
                                      starting_draft=p.draft(sec_id))
         (drafts / f"{sec_id}.r{rnd}.md").write_text(draft, encoding="utf-8")
+        say(f"  writer   done in {time.monotonic() - started:.0f} s: {len(draft.split())} words "
+            f"-> drafts/{sec_id}.r{rnd}.md")
 
         gate_issues = run_gates(draft, ctx)
         issues = blocking(gate_issues)
         if issues:
             _dump(reviews / f"{sec_id}.r{rnd}.json", {"gates": _rows(gate_issues), "review": []})
+            say(f"  gates    {len(issues)} problem(s), {_next(rnd, rounds, 'writer')}:")
+            _list(say, issues)
             continue                                   # never reaches the reviewer
+        say("  gates    passed")
 
+        say(f"  reviewer {_model('reviewer')} is reading the draft ...")
+        started = time.monotonic()
         review = agents.review_section(sec, design=p.spec.design, methods=p.inp("methods"),
                                        results=p.inp("results"), claims=table.claims, fact_reg=fact_sub,
                                        wiki_pages=pages, draft=draft)
         _dump(reviews / f"{sec_id}.r{rnd}.json", {"gates": _rows(gate_issues), "review": _rows(review)})
         issues = blocking(review)
+        took = f"done in {time.monotonic() - started:.0f} s"
         if not issues:
             (drafts / f"{sec_id}.md").write_text(draft, encoding="utf-8")
+            say(f"  reviewer {took}: no problems -> drafts/{sec_id}.md")
             return p.set_status(sec_id, "DONE")
+        say(f"  reviewer {took}: {len(issues)} problem(s), {_next(rnd, rounds, 'writer')}:")
+        _list(say, issues)
 
     _dump(reviews / f"{sec_id}.open.json", _rows(issues))   # hand over to a person; never accept silently
+    say(f"{sec_id}: {len(issues)} problem(s) left after {rounds} rounds -> state/reviews/{sec_id}.open.json")
     return p.set_status(sec_id, "ESCALATED")
 
 
-def run(p: Project, only: str | None = None) -> dict[str, str]:
-    return {sec.id: run_section(p, sec.id) for sec in p.spec.sections if only in (None, sec.id)}
+def run(p: Project, only: str | None = None, say=_quiet) -> dict[str, str]:
+    return {sec.id: run_section(p, sec.id, say) for sec in p.spec.sections if only in (None, sec.id)}
 
 
 def validate(p: Project, sec_id: str, path: Path | None = None) -> list[Issue]:
@@ -1515,6 +1560,10 @@ def _show(issues: list[Issue], as_json: bool = False) -> int:
         if not issues:
             print("ok")
     return 1 if blocking(issues) else 0
+
+
+def _say(text: str = "") -> None:
+    print(text, flush=True)                # flushed: each stage shows at once, also when the output is piped
 
 
 def _inputs_ready(root: Path, force: bool) -> bool:
@@ -1612,7 +1661,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "plan":
         if not _inputs_ready(root, args.force):
             return 1
-        table, issues = orchestrator.plan(p, args.section)
+        table, issues = orchestrator.plan(p, args.section, _say)
         print(f"{len(table.claims)} claims -> {p.claims_path(args.section)}")
         return _show(issues)
     if cmd == "approve":
@@ -1620,7 +1669,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "run":
         if not _inputs_ready(root, args.force):
             return 1
-        result = orchestrator.run(p, args.section)
+        result = orchestrator.run(p, args.section, _say)
         for sec_id, status in result.items():
             print(f"{sec_id}: {status}")
         return 0 if all(s == "DONE" for s in result.values()) else 1
@@ -1747,6 +1796,32 @@ def test_full_loop_needs_approval_then_converges(project, tmp_path):
     assert not issues
     assert "r = 0.31" in text and "{{" not in text and "<!--" not in text
     assert (tmp_path / "state" / "log").exists()
+
+
+def test_each_stage_is_reported_while_it_runs(project):
+    flagged = [Issue(gate="overclaim", message="Too strong", excerpt="This suggests")]
+    agents.LLM = fake_llm([BAD, GOOD, GOOD], [flagged, []])
+    said = []
+    orchestrator.plan(project, "discussion", said.append)
+    assert said[0] == "discussion: planning, round 1 of 3" and "is building the claim table" in said[1]
+    assert "3 claims" in said[2] and said[3] == "  check    passed"
+    orchestrator.approve(project, "discussion")
+
+    said.clear()
+    assert orchestrator.run_section(project, "discussion", said.append) == "DONE"
+    text = "\n".join(said)
+    assert [row for row in said if row.startswith("discussion:")] == [f"discussion: round {n} of 3" for n in (1, 2, 3)]
+    assert "is writing the draft" in said[1] and "-> drafts/discussion.r1.md" in said[2]
+    assert "gates    13 problem(s), back to the writer:" in text and "[numbers]" in text     # round 1 stops at the gates
+    assert "... and 8 more" in text
+    assert "reviewer done in 0 s: 1 problem(s), back to the writer:" in text and "[review:overclaim] Too strong" in text
+    assert said[-1].endswith("no problems -> drafts/discussion.md")
+    assert text.index("is writing") < text.index("gates") < text.index("is reading the draft")
+
+    agents.LLM = fake_llm([BAD, BAD, BAD], [])
+    said.clear()
+    assert orchestrator.run_section(project, "discussion", said.append) == "ESCALATED"
+    assert "no rounds left" in "\n".join(said) and said[-1].endswith("-> state/reviews/discussion.open.json")
 
 
 def test_escalates_when_rounds_run_out(project):
@@ -2748,7 +2823,7 @@ def act_plan(ui: UI, root: Path) -> None:
         return
     if not _confirm_api(ui, "planner"):
         return
-    table, issues = orchestrator.plan(p, sec_id)
+    table, issues = orchestrator.plan(p, sec_id, ui.out)
     show_claims(ui, table)
     if issues:
         show_issues(ui, issues)
@@ -2785,7 +2860,7 @@ def act_run(ui: UI, root: Path) -> None:
         return
     if not _confirm_api(ui, "writer", "reviewer"):
         return
-    status = orchestrator.run_section(p, sec_id)
+    status = orchestrator.run_section(p, sec_id, ui.out)
     ui.out(f"{sec_id}: {status}")
     if status == "DONE":
         ui.out(f"Draft: {p.root / 'drafts' / f'{sec_id}.md'}")
