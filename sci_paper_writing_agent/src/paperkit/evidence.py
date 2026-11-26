@@ -235,6 +235,8 @@ def search(root: str | Path, sec_id: str, fresh: bool = False, say=lambda text: 
     findings, search_down = [], False
     for position, claim in enumerate(claims, 1):
         earlier = before.get(claim.id, {})
+        if earlier and _key(earlier.get("text")) != _key(claim.text):
+            earlier = {}                       # the table was planned again: this id is a different claim now
         if search_down:                        # the search service stopped answering: keep what there was
             if earlier:
                 findings.append(earlier)
@@ -500,28 +502,54 @@ def apply(root: str | Path, sec_id: str, add_to_library: bool = False) -> dict:
         pages.append(key)
 
     by_id = {c.id: c for c in table.claims}
-    last = max([int(c.id[1:]) for c in table.claims if re.fullmatch(r"C\d+", c.id)] or [0])
     new, grown = [], []
+    planned = {c.id: c for c in table.claims if c.origin != ORIGIN}
+    mine = {c.id for c in table.claims if c.origin == ORIGIN}
+
+    # A note of an added claim is dropped when that id is no longer a claim of this step: the table was planned
+    # again (nothing of ours is left), or the id now belongs to a claim of the planner's.
+    noted: list[str] = []
+    for finding in data["findings"]:
+        slots = finding.setdefault("claims", {})
+        for slot, claim_id in list(slots.items()):
+            noted.append(claim_id)
+            if not mine or (claim_id in by_id and claim_id not in mine):
+                del slots[slot]
+        for other in finding["alternatives"]:
+            claim_id = other.get("claim", "")
+            noted.append(claim_id)
+            if claim_id and (not mine or (claim_id in by_id and claim_id not in mine)):
+                other["claim"] = ""
+    # new ids start above every id in the table and every id ever noted, so an id is never used twice
+    last = max([int(i[1:]) for i in [*by_id, *noted] if re.fullmatch(r"C\d+", i)] or [0])
 
     def carry(holder: dict, slot: str, text: str, category: str, cite_keys: list[str]) -> None:
         nonlocal last
         claim_id = holder.get(slot, "")
-        if claim_id:                           # added before: only new sources are added, your wording stays
+        if claim_id:
             claim = by_id.get(claim_id)
-            fresh_keys = [k for k in cite_keys if claim and k not in claim.cite_keys]
-            if fresh_keys:
+            if claim is None:
+                return                         # you deleted this one claim from the table: it is not added again
+            fresh_keys = [k for k in cite_keys if k not in claim.cite_keys]
+            if fresh_keys:                     # added before: only new sources are added, your wording stays
                 claim.cite_keys += fresh_keys
                 grown.append(claim_id)
-            return                             # a claim you deleted from the table is not added again
-        last += 1
+            return
+        last += 1                              # never added, or the table was planned again since then
         claim = Claim(id=f"C{last}", text=text, category=category, cite_keys=cite_keys, origin=ORIGIN)
         table.claims.append(claim)
         by_id[claim.id] = claim
         holder[slot] = claim.id
         new.append(claim.id)
 
+    stale = 0
     for finding in data["findings"]:
         finding.setdefault("claims", {})
+        claim_now = planned.get(finding.get("claim_id"))
+        if claim_now is None or _key(claim_now.text) != _key(finding.get("text")):
+            # the claim this was found for is gone or reworded (the table was planned again or edited)
+            stale += sum(row.get("decision") == "accepted" for row in finding["papers"] + finding["alternatives"])
+            continue
         ours = _line(finding["text"]).rstrip(".")
         for group in ("supports", "contradicts", "other"):
             rows = [row for row in finding["papers"] if row.get("decision") == "accepted"
@@ -545,7 +573,7 @@ def apply(root: str | Path, sec_id: str, add_to_library: bool = False) -> dict:
         p.set_status(sec_id, "AWAITING_APPROVAL")
     save(root, sec_id, data)
     return {"new": new, "grown": grown, "pages": pages, "added_to_library": added_to_library,
-            "waiting": [_line(row["title"], 90) for row in missing]}
+            "waiting": [_line(row["title"], 90) for row in missing], "stale": stale}
 
 
 def missing_from_library(root: str | Path, sec_id: str) -> int:
@@ -576,6 +604,10 @@ def _report_apply(done: dict, sec_id: str, out) -> None:
             out(f"  - {title}")
         out(f"Import refs/suggested.bib into Zotero, then run: paperkit evidence apply {sec_id}")
         out("If Zotero does not write refs/library.bib, add --add-to-library instead.")
+    if done["stale"]:
+        out(f"{done['stale']} accepted suggestion(s) belong to claims that are no longer in the claim table "
+            "(it was planned again or edited), so they were left out.")
+        out(f"Search again for the claims as they are now: paperkit evidence search {sec_id}")
     if not any(done.values()):
         out("Nothing to carry over: no accepted suggestion is waiting.")
 

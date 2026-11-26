@@ -155,6 +155,26 @@ Nothing is written from a table you have not approved.
 - A section in `paper.yaml` without a finished draft is reported as blocking. Remove a section from `paper.yaml` if you are not writing it.
 - For a draft over its word limit, the report says where to shorten it.
 
+## If you change something later
+
+Nothing that is already written changes by itself. A change takes effect when the step that reads the file runs again.
+
+| You changed | Run again |
+|---|---|
+| `inputs/<section>_draft.md`: wording, marks, or the file removed | 9, 10 |
+| `inputs/<section>_draft.md`: what the section says | 6, 8, 9, 10 |
+| Methods, Results, key messages, limitations or introduction notes | 6, 8, 9, 10 |
+| `inputs/facts.csv`: a corrected value under the same id | `paperkit facts`, then 10 |
+| `inputs/facts.csv`: facts added or removed | `paperkit facts`, then 6, 8, 9, 10 |
+| `refs/library.bib`: new references the section should cite | 6, 8, 9, 10 |
+| The claim table, by hand | 8, 9, 10 |
+| Approved writing rules, word limits or headings in `paper.yaml` | 9, 10 |
+| A page in `wiki/` | 9, 10 |
+
+Step 6 replaces the claim table for that section. If you used the literature search, run `paperkit evidence apply <section>` after step 6: it adds the accepted suggestions again for every claim that is unchanged. For claims that changed, run `paperkit evidence search <section>` again.
+
+Setup and the rules from the guides (step 5) never need repeating because of such a change. Step 4 is worth repeating only if the Results changed.
+
 ## Inputs
 
 "Required" inputs are the ones `plan` and `run` insist on. `paperkit check` shows the state of each.
@@ -2286,6 +2306,8 @@ def search(root: str | Path, sec_id: str, fresh: bool = False, say=lambda text: 
     findings, search_down = [], False
     for position, claim in enumerate(claims, 1):
         earlier = before.get(claim.id, {})
+        if earlier and _key(earlier.get("text")) != _key(claim.text):
+            earlier = {}                       # the table was planned again: this id is a different claim now
         if search_down:                        # the search service stopped answering: keep what there was
             if earlier:
                 findings.append(earlier)
@@ -2551,28 +2573,54 @@ def apply(root: str | Path, sec_id: str, add_to_library: bool = False) -> dict:
         pages.append(key)
 
     by_id = {c.id: c for c in table.claims}
-    last = max([int(c.id[1:]) for c in table.claims if re.fullmatch(r"C\d+", c.id)] or [0])
     new, grown = [], []
+    planned = {c.id: c for c in table.claims if c.origin != ORIGIN}
+    mine = {c.id for c in table.claims if c.origin == ORIGIN}
+
+    # A note of an added claim is dropped when that id is no longer a claim of this step: the table was planned
+    # again (nothing of ours is left), or the id now belongs to a claim of the planner's.
+    noted: list[str] = []
+    for finding in data["findings"]:
+        slots = finding.setdefault("claims", {})
+        for slot, claim_id in list(slots.items()):
+            noted.append(claim_id)
+            if not mine or (claim_id in by_id and claim_id not in mine):
+                del slots[slot]
+        for other in finding["alternatives"]:
+            claim_id = other.get("claim", "")
+            noted.append(claim_id)
+            if claim_id and (not mine or (claim_id in by_id and claim_id not in mine)):
+                other["claim"] = ""
+    # new ids start above every id in the table and every id ever noted, so an id is never used twice
+    last = max([int(i[1:]) for i in [*by_id, *noted] if re.fullmatch(r"C\d+", i)] or [0])
 
     def carry(holder: dict, slot: str, text: str, category: str, cite_keys: list[str]) -> None:
         nonlocal last
         claim_id = holder.get(slot, "")
-        if claim_id:                           # added before: only new sources are added, your wording stays
+        if claim_id:
             claim = by_id.get(claim_id)
-            fresh_keys = [k for k in cite_keys if claim and k not in claim.cite_keys]
-            if fresh_keys:
+            if claim is None:
+                return                         # you deleted this one claim from the table: it is not added again
+            fresh_keys = [k for k in cite_keys if k not in claim.cite_keys]
+            if fresh_keys:                     # added before: only new sources are added, your wording stays
                 claim.cite_keys += fresh_keys
                 grown.append(claim_id)
-            return                             # a claim you deleted from the table is not added again
-        last += 1
+            return
+        last += 1                              # never added, or the table was planned again since then
         claim = Claim(id=f"C{last}", text=text, category=category, cite_keys=cite_keys, origin=ORIGIN)
         table.claims.append(claim)
         by_id[claim.id] = claim
         holder[slot] = claim.id
         new.append(claim.id)
 
+    stale = 0
     for finding in data["findings"]:
         finding.setdefault("claims", {})
+        claim_now = planned.get(finding.get("claim_id"))
+        if claim_now is None or _key(claim_now.text) != _key(finding.get("text")):
+            # the claim this was found for is gone or reworded (the table was planned again or edited)
+            stale += sum(row.get("decision") == "accepted" for row in finding["papers"] + finding["alternatives"])
+            continue
         ours = _line(finding["text"]).rstrip(".")
         for group in ("supports", "contradicts", "other"):
             rows = [row for row in finding["papers"] if row.get("decision") == "accepted"
@@ -2596,7 +2644,7 @@ def apply(root: str | Path, sec_id: str, add_to_library: bool = False) -> dict:
         p.set_status(sec_id, "AWAITING_APPROVAL")
     save(root, sec_id, data)
     return {"new": new, "grown": grown, "pages": pages, "added_to_library": added_to_library,
-            "waiting": [_line(row["title"], 90) for row in missing]}
+            "waiting": [_line(row["title"], 90) for row in missing], "stale": stale}
 
 
 def missing_from_library(root: str | Path, sec_id: str) -> int:
@@ -2627,6 +2675,10 @@ def _report_apply(done: dict, sec_id: str, out) -> None:
             out(f"  - {title}")
         out(f"Import refs/suggested.bib into Zotero, then run: paperkit evidence apply {sec_id}")
         out("If Zotero does not write refs/library.bib, add --add-to-library instead.")
+    if done["stale"]:
+        out(f"{done['stale']} accepted suggestion(s) belong to claims that are no longer in the claim table "
+            "(it was planned again or edited), so they were left out.")
+        out(f"Search again for the claims as they are now: paperkit evidence search {sec_id}")
     if not any(done.values()):
         out("Nothing to carry over: no accepted suggestion is waiting.")
 
@@ -6998,6 +7050,40 @@ def test_accepted_suggestions_reach_the_claim_table_only_through_the_library(pro
     p.save_claims(table)
     assert main(["--root", str(project), "evidence", "apply", "discussion"]) == 0
     assert [c.id for c in orchestrator.Project(project).load_claims("discussion").claims] == ["C1", "C2", "C3", "C4", "C5"]
+
+
+def test_planning_again_brings_accepted_suggestions_back_and_never_touches_the_wrong_claim(project, monkeypatch, capsys):
+    searched(project, monkeypatch)
+    assert main(["--root", str(project), "evidence", "accept", "discussion", "E1", "A1", "--add-to-library"]) == 0
+    p = orchestrator.Project(project)
+    first = p.load_claims("discussion")
+    assert [(c.id, c.origin) for c in first.claims[3:]] == [("C4", "evidence search"), ("C5", "evidence search")]
+
+    # planned again with the same claims: C4 is now a new claim of the planner's, and the two added claims are gone
+    again = [c.model_copy() for c in CLAIMS] + [Claim(id="C4", text="A new point of the planner.", category="INFERRED")]
+    p.save_claims(ClaimTable(section_id="discussion", approved=True, claims=again))
+    capsys.readouterr()
+    assert main(["--root", str(project), "evidence", "apply", "discussion"]) == 0
+    assert "New claims in the claim table: C6, C7" in capsys.readouterr().out      # an id is never used twice
+    table = orchestrator.Project(project).load_claims("discussion")
+    assert table.claims[3].text == "A new point of the planner." and table.claims[3].cite_keys == []    # left alone
+    assert [(c.id, c.origin, c.cite_keys) for c in table.claims[4:]] == [
+        ("C6", "evidence search", ["smith2020sleep"]), ("C7", "evidence search", ["smith2020sleep"])]
+    assert table.approved is False
+
+    # planned again with C1 reworded: what was accepted for the old C1 is not carried into the new table
+    changed = [Claim(id="C1", text="Short sleep went with worse attention.", category="OBSERVED", fact_ids=["F1"])] + \
+              [c.model_copy() for c in CLAIMS[1:]]
+    p.save_claims(ClaimTable(section_id="discussion", approved=True, claims=changed))
+    assert main(["--root", str(project), "evidence", "apply", "discussion"]) == 0
+    out = capsys.readouterr().out
+    assert "2 accepted suggestion(s) belong to claims that are no longer in the claim table" in out
+    assert "paperkit evidence search discussion" in out and "New claims" not in out
+    assert [c.id for c in orchestrator.Project(project).load_claims("discussion").claims] == ["C1", "C2", "C3"]
+
+    evidence.search(project, "discussion")                            # searched again: old decisions do not move to the new C1
+    rows = {f["claim_id"]: f["papers"] + f["alternatives"] for f in stored(project)["findings"]}
+    assert all(row["decision"] == "" for row in rows["C1"])
 
 
 def test_accept_by_id_can_add_the_paper_to_a_library_kept_by_hand(project, monkeypatch, capsys):

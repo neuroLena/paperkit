@@ -222,6 +222,40 @@ def test_accepted_suggestions_reach_the_claim_table_only_through_the_library(pro
     assert [c.id for c in orchestrator.Project(project).load_claims("discussion").claims] == ["C1", "C2", "C3", "C4", "C5"]
 
 
+def test_planning_again_brings_accepted_suggestions_back_and_never_touches_the_wrong_claim(project, monkeypatch, capsys):
+    searched(project, monkeypatch)
+    assert main(["--root", str(project), "evidence", "accept", "discussion", "E1", "A1", "--add-to-library"]) == 0
+    p = orchestrator.Project(project)
+    first = p.load_claims("discussion")
+    assert [(c.id, c.origin) for c in first.claims[3:]] == [("C4", "evidence search"), ("C5", "evidence search")]
+
+    # planned again with the same claims: C4 is now a new claim of the planner's, and the two added claims are gone
+    again = [c.model_copy() for c in CLAIMS] + [Claim(id="C4", text="A new point of the planner.", category="INFERRED")]
+    p.save_claims(ClaimTable(section_id="discussion", approved=True, claims=again))
+    capsys.readouterr()
+    assert main(["--root", str(project), "evidence", "apply", "discussion"]) == 0
+    assert "New claims in the claim table: C6, C7" in capsys.readouterr().out      # an id is never used twice
+    table = orchestrator.Project(project).load_claims("discussion")
+    assert table.claims[3].text == "A new point of the planner." and table.claims[3].cite_keys == []    # left alone
+    assert [(c.id, c.origin, c.cite_keys) for c in table.claims[4:]] == [
+        ("C6", "evidence search", ["smith2020sleep"]), ("C7", "evidence search", ["smith2020sleep"])]
+    assert table.approved is False
+
+    # planned again with C1 reworded: what was accepted for the old C1 is not carried into the new table
+    changed = [Claim(id="C1", text="Short sleep went with worse attention.", category="OBSERVED", fact_ids=["F1"])] + \
+              [c.model_copy() for c in CLAIMS[1:]]
+    p.save_claims(ClaimTable(section_id="discussion", approved=True, claims=changed))
+    assert main(["--root", str(project), "evidence", "apply", "discussion"]) == 0
+    out = capsys.readouterr().out
+    assert "2 accepted suggestion(s) belong to claims that are no longer in the claim table" in out
+    assert "paperkit evidence search discussion" in out and "New claims" not in out
+    assert [c.id for c in orchestrator.Project(project).load_claims("discussion").claims] == ["C1", "C2", "C3"]
+
+    evidence.search(project, "discussion")                            # searched again: old decisions do not move to the new C1
+    rows = {f["claim_id"]: f["papers"] + f["alternatives"] for f in stored(project)["findings"]}
+    assert all(row["decision"] == "" for row in rows["C1"])
+
+
 def test_accept_by_id_can_add_the_paper_to_a_library_kept_by_hand(project, monkeypatch, capsys):
     searched(project, monkeypatch)
     assert main(["--root", str(project), "evidence", "accept", "E1", "--add-to-library"]) == 0     # section left out

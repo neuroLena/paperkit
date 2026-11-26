@@ -123,6 +123,26 @@ Nothing is written from a table you have not approved.
 - A section in `paper.yaml` without a finished draft is reported as blocking. Remove a section from `paper.yaml` if you are not writing it.
 - For a draft over its word limit, the report says where to shorten it.
 
+## If you change something later
+
+Nothing that is already written changes by itself. A change takes effect when the step that reads the file runs again.
+
+| You changed | Run again |
+|---|---|
+| `inputs/<section>_draft.md`: wording, marks, or the file removed | 9, 10 |
+| `inputs/<section>_draft.md`: what the section says | 6, 8, 9, 10 |
+| Methods, Results, key messages, limitations or introduction notes | 6, 8, 9, 10 |
+| `inputs/facts.csv`: a corrected value under the same id | `paperkit facts`, then 10 |
+| `inputs/facts.csv`: facts added or removed | `paperkit facts`, then 6, 8, 9, 10 |
+| `refs/library.bib`: new references the section should cite | 6, 8, 9, 10 |
+| The claim table, by hand | 8, 9, 10 |
+| Approved writing rules, word limits or headings in `paper.yaml` | 9, 10 |
+| A page in `wiki/` | 9, 10 |
+
+Step 6 replaces the claim table for that section. If you used the literature search, run `paperkit evidence apply <section>` after step 6: it adds the accepted suggestions again for every claim that is unchanged. For claims that changed, run `paperkit evidence search <section>` again.
+
+Setup and the rules from the guides (step 5) never need repeating because of such a change. Step 4 is worth repeating only if the Results changed.
+
 ## Inputs
 
 "Required" inputs are the ones `plan` and `run` insist on. `paperkit check` shows the state of each.
