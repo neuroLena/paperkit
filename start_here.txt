@@ -1,67 +1,175 @@
-# PaperKit — Installation and startup
+# PaperKit: start here
 
-## 1. Configure Git identity (first time only)
+To write a paper you need Part A only. It takes about ten minutes.
 
-Check that Git is installed:
+`publish.sh` is a development tool. It commits the code and uploads it to GitHub.
+You do not need it, a GitHub account, SSH keys or a token to write a paper.
+All of that is in Part B, for when you change PaperKit's code and want it on GitHub.
+
+What to do once PaperKit runs (inputs, steps and their order) is in
+`sci_paper_writing_agent/README.md`.
+
+
+# Part A. Set up and start
+
+## 1. Run setup.sh first
+
+Everything starts with this one command, in the `paperkit` folder:
+
+```bash
+cd paperkit
+bash setup.sh
+```
+
+You need a Mac or Linux terminal and an internet connection.
+
+What it does, in this order:
+
+- Installs `uv` and Python 3.11 if they are missing.
+- Creates the project folder `sci_paper_writing_agent/`.
+- Creates `.env` (your keys, readable only by you), `.env.example` and `.gitignore` next to `setup.sh`.
+- Creates the Python environment `.venv/` next to `setup.sh` and installs the packages.
+- Runs the tests and prints the checklist of inputs. A new project fails that checklist: that is expected.
+- Makes a first local commit. Nothing is uploaded. If Git does not know your name yet, it says so and carries on (see B1).
+
+It is safe to run again. Files that exist are not overwritten.
+
+Git must be installed for the commit step. If it is not, or you do not want a repository:
+
+```bash
+NO_GIT=1 bash setup.sh
+```
+
+The folders after setup:
+
+```text
+paperkit/
+  setup.sh  scaffold.py  publish.sh  start_here.txt
+  .env  .env.example  .gitignore  .venv/
+  sci_paper_writing_agent/      the project: inputs, drafts, code, README.md
+```
+
+## 2. Put your keys in .env
+
+The one `.env` file is in the `paperkit` folder, next to `setup.sh`. Open it:
+
+```bash
+nano .env
+```
+
+Fill in what you use:
+
+```dotenv
+# Required to call a model: one of these two keys
+NVIDIA_API_KEY=YOUR_NVIDIA_API_KEY
+ANTHROPIC_API_KEY=
+
+# Which provider and model to use (IDs change: copy the ID from the model's page on build.nvidia.com)
+PAPERKIT_PROVIDER=nvidia
+PAPERKIT_MODEL=z-ai/glm-5.3
+
+# Recommended with the free NVIDIA models: think less, and allow a long answer
+PAPERKIT_REASONING=low
+PAPERKIT_MAX_TOKENS=16000
+
+# Optional: only for the literature search (free key at semanticscholar.org/product/api)
+SEMANTIC_SCHOLAR_API_KEY=
+```
+
+In nano, save with Ctrl+O then Enter, and exit with Ctrl+X.
+
+You do not have to load this file into the terminal: `paperkit` reads it by itself.
+Instead of editing it by hand, you can also let `paperkit start`, menu 9, save the provider, the model and the key.
+
+## 3. Start PaperKit
+
+```bash
+source .venv/bin/activate
+paperkit start
+```
+
+`paperkit start` shows the checklist of inputs, helps you fill in what is missing, and then offers every step from a menu.
+
+To check that the model answers:
+
+```bash
+paperkit ping
+```
+
+Now open `sci_paper_writing_agent/README.md`. It lists the steps in order and says which inputs and steps are required and which are optional.
+
+## 4. Every later session
+
+```bash
+cd paperkit
+source .venv/bin/activate
+paperkit start
+```
+
+## 5. Updating to a newer scaffold.py
+
+Replace `scaffold.py` in the `paperkit` folder with the new one, then:
+
+```bash
+UPDATE_CODE=1 bash setup.sh
+```
+
+This refreshes the code, the tests and the README in the project. Your inputs, `paper.yaml`, drafts, claim tables and rules are never overwritten.
+If a new version adds a section to the default `paper.yaml` (for example the Introduction), add it to your own `paper.yaml` by hand.
+
+To run the tests yourself:
+
+```bash
+cd sci_paper_writing_agent
+python -m pytest -q
+```
+
+
+# Part B. Development only: Git, GitHub and publish.sh
+
+Skip this part unless you change PaperKit's code and want to keep it on GitHub.
+
+What `publish.sh` uploads: the scripts, the code, the configuration, the rules, the wiki pages and the reference library.
+What it never uploads (the `.gitignore` keeps them out): `.env`, `.venv/`, `inputs/`, `drafts/`, `state/`, `facts/`, `build/`, `.papers/`, `.writing_guides/` and `.cache/`.
+So your manuscript text is not backed up by it: keep your own copy of `inputs/` and `drafts/`.
+
+## B1. Tell Git who you are (first time only)
 
 ```bash
 git --version
-```
-
-Configure your name and GitHub email:
-
-```bash
 git config --global user.name "YOUR_NAME"
 git config --global user.email "YOUR_GITHUB_EMAIL"
-git config --global github.user "YOUR_GITHUB_USERNAME"
 ```
 
-Verify the configuration:
+These settings name the author of commits. They do not sign you in to GitHub.
+Without them, the commit step of `setup.sh` and `publish.sh` stops with a message that asks for them.
 
-```bash
-git config --global --get user.name
-git config --global --get user.email
-git config --global --get github.user
-```
+## B2. Set up SSH for GitHub (first time only)
 
-These settings identify the author of Git commits but do not authenticate your GitHub account.
-
-## 2. Configure GitHub SSH authentication (first time only)
-
-Create the SSH configuration directory:
-
-```bash
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-```
-
-Check whether an SSH key already exists:
+Check whether you already have a key:
 
 ```bash
 ls -la ~/.ssh
 ```
 
-If `id_ed25519` and `id_ed25519.pub` do not exist, generate a new key:
+If `id_ed25519` and `id_ed25519.pub` are not there, create a key:
 
 ```bash
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
 ssh-keygen -t ed25519 -C "$(git config --global user.email)"
 ```
 
-Press Enter to accept the default location. Optionally, enter a passphrase to protect the key.
+Press Enter to accept the default location. A passphrase is optional.
 
-Start the SSH agent:
+Start the agent and add the key (macOS):
 
 ```bash
 eval "$(ssh-agent -s)"
-```
-
-Add your SSH key:
-
-```bash
 ssh-add --apple-use-keychain ~/.ssh/id_ed25519
 ```
 
-Create or open the SSH configuration file:
+Open the SSH configuration file:
 
 ```bash
 touch ~/.ssh/config
@@ -69,7 +177,7 @@ chmod 600 ~/.ssh/config
 nano ~/.ssh/config
 ```
 
-Add the following configuration if a GitHub entry does not already exist:
+Add this, if there is no GitHub entry yet:
 
 ```text
 Host github.com
@@ -80,248 +188,86 @@ Host github.com
     IdentityFile ~/.ssh/id_ed25519
 ```
 
-Copy your public SSH key:
+Copy the public key and add it at https://github.com/settings/keys (New SSH key):
 
 ```bash
 pbcopy < ~/.ssh/id_ed25519.pub
 ```
 
-Open https://github.com/settings/keys in your browser.
-
-Select **New SSH key**, enter a descriptive title, paste the public key and save it.
-
-Test authentication:
+Test it:
 
 ```bash
 ssh -T git@github.com
 ```
 
-On the first connection, verify the server fingerprint against GitHub's published SSH fingerprints before accepting it.
-
-Expected response:
+On the first connection, compare the fingerprint it shows with the ones GitHub publishes before you accept it.
+The expected answer is:
 
 ```text
-Hi YOUR_USERNAME! You've successfully authenticated,
-but GitHub does not provide shell access.
+Hi YOUR_USERNAME! You've successfully authenticated, but GitHub does not provide shell access.
 ```
 
-## 3. Set up PaperKit
+## B3. A GitHub token (only to create the repository)
 
-Navigate to the repository root:
+`publish.sh` needs a token once, to create the repository on GitHub. Later pushes use SSH.
+You can skip the token if the GitHub CLI (`gh`) is installed and signed in, or if you create an empty repository yourself and add it as the remote:
 
 ```bash
-cd paperkit
+git remote add origin git@github.com:YOUR_USERNAME/REPOSITORY_NAME.git
 ```
 
-Run the setup script:
+To make a token: open https://github.com/settings/tokens, choose Tokens (classic), Generate new token (classic), with the scope `repo` and an expiry of 30 or 90 days.
 
-```bash
-bash setup.sh
-```
-
-For an existing project, run:
-
-```bash
-UPDATE_CODE=1 bash setup.sh
-```
-
-Your `paper.yaml` is never overwritten, so add the Introduction section manually if it is missing.
-
-## 4. Generate a GitHub Personal Access Token
-
-Open:
-
-https://github.com/settings/tokens
-
-Select **Tokens (classic) → Generate new token (classic)**.
-
-Configure:
-
-- Note: PaperKit publishing
-- Expiration: 30 or 90 days
-- Scope: repo
-
-Generate the token and copy it securely.
-
-The token is required for automatically creating a new GitHub repository through the REST API. Subsequent Git pushes use SSH authentication.
-
-## 5. Configure environment variables
-
-The centralized `.env` file should be located in the root `paperkit/` directory.
-
-If the setup script has not already created it:
-
-```bash
-touch .env
-chmod 600 .env
-```
-
-Open the file:
-
-```bash
-nano .env
-```
-
-Configure the required credentials:
+Put it in `.env`, with your user name:
 
 ```dotenv
-# GitHub configuration
 GITHUB_USER=YOUR_GITHUB_USERNAME
 GITHUB_TOKEN=YOUR_GITHUB_TOKEN
 VISIBILITY=private
-
-# NVIDIA API configuration
-NVIDIA_API_KEY=YOUR_NVIDIA_API_KEY
-
-# Anthropic API configuration (optional)
-ANTHROPIC_API_KEY=
 ```
 
-Save with Ctrl+C, Enter, and exit with Ctrl+X.
+## B4. Publish
 
-Ensure that credentials are excluded from Git:
+From the `paperkit` folder:
 
 ```bash
-touch .gitignore
-
-grep -Fxq '.env' .gitignore || \
-    printf '\n.env\n' >> .gitignore
-
-chmod 600 .env
+bash publish.sh "Describe the changes"
 ```
 
-If the Git repository has already been initialized, verify the exclusion:
+The script, in this order:
+
+- Stops if a folder inside has a Git repository of its own.
+- Makes this folder a Git repository, if it is not one yet.
+- Stops if `.env` is not ignored.
+- Stops if a file that would be committed looks like it holds an API key.
+- Commits everything that is not ignored.
+- On the first push, asks for the repository name and whether it is private or public, creates it on GitHub, and sets the SSH remote.
+- Pushes.
+
+To name the repository without being asked:
 
 ```bash
-git check-ignore -v .env
+REPO_NAME=my-paperkit VISIBILITY=private bash publish.sh "Initial commit"
 ```
 
-Load the environment variables into the current terminal session:
-
-```bash
-set -a
-source .env
-set +a
-```
-
-## 6. Activate the Python environment
-
-```bash
-source .venv/bin/activate
-```
-
-Verify the installation:
-
-```bash
-python --version
-which python
-paperkit --help
-```
-
-Run automated tests:
-
-```bash
-python -m pytest -v
-```
-
-source .venv/bin/activate
-cd sci_paper_writing_agent
-paperkit extract facts
-paperkit extract key-messages
-
-
-## 7. Publish the repository to GitHub
-
-From the root `paperkit/` directory:
-
-```bash
-bash publish.sh "Initial commit"
-```
-
-The publishing script will:
-
-- Initialize the local Git repository if necessary.
-- Check for nested Git repositories.
-- Check Git exclusions.
-- Scan staged files for recognizable API keys.
-- Commit the project.
-- Ask for a GitHub repository name if no remote is configured.
-- Create a private or public repository using the GitHub API.
-- Configure the SSH remote.
-- Push the project to GitHub.
-
-To specify the repository name directly:
-
-```bash
-REPO_NAME=my-paperkit VISIBILITY=private \
-    bash publish.sh "Initial commit"
-```
-
-Verify the configured remote:
-
-```bash
-git remote -v
-```
-
-## 8. Start PaperKit
-
-```bash
-paperkit start
-```
-
-## 9. Subsequent sessions
-
-The initial installation, SSH setup and GitHub token creation do not need to be repeated.
-
-To start the application:
-
-```bash
-cd paperkit
-source .venv/bin/activate
-paperkit start
-```
-
-To update the application:
-
-```bash
-UPDATE_CODE=1 bash setup.sh
-```
-
-To test the application:
-
-```bash
-python -m pytest -v
-```
-
-To commit and publish changes:
-
-```bash
-bash publish.sh "Describe changes"
-```
-
-To commit locally without uploading to GitHub:
+To commit without uploading:
 
 ```bash
 LOCAL_ONLY=1 bash publish.sh "Local changes"
 ```
 
-To retrieve changes from GitHub:
+Other commands you may need:
 
 ```bash
-git pull
+git remote -v     # where it pushes to
+git pull          # fetch changes from GitHub
 ```
 
-## 10. Security
+## B5. What must never be uploaded
 
-Never upload the following files or directories to GitHub:
+- `.env` and any other file that holds a key.
+- Private SSH keys. Only the public key, the file ending in `.pub`, goes into GitHub's settings.
+- `.venv/`, `.cache/`, `.papers/` and `.writing_guides/`.
+- Confidential research data, and model logs that contain it (`state/log/`).
 
-- `.env` and other files containing credentials.
-- Private SSH keys.
-- `.venv/`.
-- `.papers/`.
-- `.writing_guides/`.
-- `.cache/`.
-- Confidential research data.
-- Agent logs containing sensitive research information.
-
-Only public SSH keys ending in `.pub` should be uploaded to GitHub's SSH key settings.
+The `.gitignore` that `setup.sh` creates already covers these folders, and `publish.sh` checks `.env` and scans for keys before every commit.
