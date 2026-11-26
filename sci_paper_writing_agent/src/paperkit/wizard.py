@@ -628,6 +628,7 @@ def menu(ui: UI, root: Path) -> int:
         if choice == "q":
             return 0
         try:
+            env.load_env(root)        # a key or setting you put in .env while this menu was open counts from now on
             ACTIONS[choice](ui, root)
         except Quit:
             raise

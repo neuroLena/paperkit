@@ -162,6 +162,7 @@ def test_no_claim_table_and_a_dead_search_service_are_said_plainly(project, monk
     assert main(["--root", str(project), "evidence", "search", "discussion"]) == 1
     out = capsys.readouterr().out
     assert "failed: C1: Semantic Scholar is not answering" in out and "SEMANTIC_SCHOLAR_API_KEY" in out
+    assert f"No SEMANTIC_SCHOLAR_API_KEY was found. paperkit looked in {project.parent / '.env'} and in the shell" in out
     assert out.count("  failed: ") == 1                               # it did not go on to hammer the service for C2
 
     (project / "state" / "claims" / "discussion.json").unlink()

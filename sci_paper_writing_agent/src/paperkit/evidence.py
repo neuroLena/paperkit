@@ -24,7 +24,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from . import agents, keys, orchestrator, scholar, zotero
+from . import agents, env, keys, orchestrator, scholar, zotero
 from .schemas import Claim
 
 KINDS = ("supporting", "contradicting", "alternative")
@@ -624,6 +624,9 @@ def run(root: str | Path, action: str, sec_id: str, ids=(), fresh: bool = False,
                 f"{len(got['data']['findings'])} claim(s) -> build/evidence_{sec_id}.md")
             for row in got["failed"]:
                 out(f"  failed: {row}")
+            if got["failed"] and not scholar.has_key():
+                out(f"No SEMANTIC_SCHOLAR_API_KEY was found. paperkit looked in {env.env_path(root)} and in the shell: "
+                    "check that the line is in that file, is spelled this way and has no # in front.")
             if got["failed"]:
                 out("Run it again for what failed: answered searches and model calls are kept and are not repeated.")
             if not scholar.has_key() and not got["failed"]:

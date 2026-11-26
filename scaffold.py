@@ -2095,7 +2095,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from . import agents, keys, orchestrator, scholar, zotero
+from . import agents, env, keys, orchestrator, scholar, zotero
 from .schemas import Claim
 
 KINDS = ("supporting", "contradicting", "alternative")
@@ -2695,6 +2695,9 @@ def run(root: str | Path, action: str, sec_id: str, ids=(), fresh: bool = False,
                 f"{len(got['data']['findings'])} claim(s) -> build/evidence_{sec_id}.md")
             for row in got["failed"]:
                 out(f"  failed: {row}")
+            if got["failed"] and not scholar.has_key():
+                out(f"No SEMANTIC_SCHOLAR_API_KEY was found. paperkit looked in {env.env_path(root)} and in the shell: "
+                    "check that the line is in that file, is spelled this way and has no # in front.")
             if got["failed"]:
                 out("Run it again for what failed: answered searches and model calls are kept and are not repeated.")
             if not scholar.has_key() and not got["failed"]:
@@ -3951,6 +3954,8 @@ from pathlib import Path
 
 from dotenv import dotenv_values, set_key
 
+_FROM_FILE: dict[str, str] = {}     # what this process took from the file, so a later edit of the file can replace it
+
 
 def env_path(root: Path) -> Path:
     """<repository>/.env, where the repository is the folder that holds the project folder.
@@ -3962,17 +3967,22 @@ def env_path(root: Path) -> Path:
 
 
 def load_env(root: Path) -> list[str]:
-    """Loads the variables from the shared .env and returns the names it set.
+    """Loads the variables from the shared .env and returns the names it set or changed.
 
-    Empty values are ignored, so an untouched copy of .env.example changes nothing.
+    Empty values are ignored, so an untouched copy of .env.example changes nothing. A value from the shell
+    always wins. The file can be read again at any time: a line you added or changed since then is picked up.
     """
     path = env_path(root)
     if not path.is_file():
         return []
     loaded = []
     for name, value in dotenv_values(path).items():
-        if name and value and not os.environ.get(name):
-            os.environ[name] = value
+        if not name or not value:
+            continue
+        current = os.environ.get(name)
+        ours = name in _FROM_FILE and current == _FROM_FILE[name]      # set by an earlier read, untouched since
+        if not current or (ours and current != value):
+            os.environ[name] = _FROM_FILE[name] = value
             loaded.append(name)
     return loaded
 
@@ -5064,6 +5074,7 @@ def menu(ui: UI, root: Path) -> int:
         if choice == "q":
             return 0
         try:
+            env.load_env(root)        # a key or setting you put in .env while this menu was open counts from now on
             ACTIONS[choice](ui, root)
         except Quit:
             raise
@@ -5369,6 +5380,30 @@ def test_saving_a_key_keeps_the_other_lines_and_limits_the_file(fresh):
     if os.name != "nt":
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert not (fresh / ".env").exists()
+
+
+def test_a_line_added_to_env_while_the_menu_is_open_counts_for_the_next_step(fresh, monkeypatch):
+    monkeypatch.setattr(env, "_FROM_FILE", {})
+    for name in ("SEMANTIC_SCHOLAR_API_KEY", "PAPERKIT_MAX_TOKENS", "NVIDIA_API_KEY"):
+        monkeypatch.setenv(name, "")
+    env_file = fresh.parent / ".env"
+    env_file.write_text("PAPERKIT_MAX_TOKENS=8000\n", encoding="utf-8")
+    assert env.load_env(fresh) == ["PAPERKIT_MAX_TOKENS"]                 # what paperkit reads when it starts
+
+    seen = []
+    monkeypatch.setitem(wizard.ACTIONS, "8", lambda ui, root: seen.append(
+        (os.environ.get("SEMANTIC_SCHOLAR_API_KEY"), os.environ.get("PAPERKIT_MAX_TOKENS"), os.environ.get("NVIDIA_API_KEY"))))
+    monkeypatch.setenv("NVIDIA_API_KEY", "from-the-shell")
+    answers = iter(["8", "8", "q"])
+
+    def ask(prompt=""):
+        if not seen:                                                      # you edit .env with the menu still open
+            env_file.write_text("PAPERKIT_MAX_TOKENS=16000\nSEMANTIC_SCHOLAR_API_KEY=s2-key\nNVIDIA_API_KEY=from-the-file\n",
+                                encoding="utf-8")
+        return next(answers)
+
+    assert wizard.menu(wizard.UI(ask=ask, out=lambda text="": None, color=False), fresh) == 0
+    assert seen == [("s2-key", "16000", "from-the-shell")] * 2            # new line and changed value seen; the shell still wins
 
 
 def test_saving_a_key_adds_env_to_the_repository_gitignore(fresh):
@@ -6992,6 +7027,7 @@ def test_no_claim_table_and_a_dead_search_service_are_said_plainly(project, monk
     assert main(["--root", str(project), "evidence", "search", "discussion"]) == 1
     out = capsys.readouterr().out
     assert "failed: C1: Semantic Scholar is not answering" in out and "SEMANTIC_SCHOLAR_API_KEY" in out
+    assert f"No SEMANTIC_SCHOLAR_API_KEY was found. paperkit looked in {project.parent / '.env'} and in the shell" in out
     assert out.count("  failed: ") == 1                               # it did not go on to hammer the service for C2
 
     (project / "state" / "claims" / "discussion.json").unlink()

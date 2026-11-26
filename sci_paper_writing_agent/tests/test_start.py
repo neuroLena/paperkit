@@ -267,6 +267,30 @@ def test_saving_a_key_keeps_the_other_lines_and_limits_the_file(fresh):
     assert not (fresh / ".env").exists()
 
 
+def test_a_line_added_to_env_while_the_menu_is_open_counts_for_the_next_step(fresh, monkeypatch):
+    monkeypatch.setattr(env, "_FROM_FILE", {})
+    for name in ("SEMANTIC_SCHOLAR_API_KEY", "PAPERKIT_MAX_TOKENS", "NVIDIA_API_KEY"):
+        monkeypatch.setenv(name, "")
+    env_file = fresh.parent / ".env"
+    env_file.write_text("PAPERKIT_MAX_TOKENS=8000\n", encoding="utf-8")
+    assert env.load_env(fresh) == ["PAPERKIT_MAX_TOKENS"]                 # what paperkit reads when it starts
+
+    seen = []
+    monkeypatch.setitem(wizard.ACTIONS, "8", lambda ui, root: seen.append(
+        (os.environ.get("SEMANTIC_SCHOLAR_API_KEY"), os.environ.get("PAPERKIT_MAX_TOKENS"), os.environ.get("NVIDIA_API_KEY"))))
+    monkeypatch.setenv("NVIDIA_API_KEY", "from-the-shell")
+    answers = iter(["8", "8", "q"])
+
+    def ask(prompt=""):
+        if not seen:                                                      # you edit .env with the menu still open
+            env_file.write_text("PAPERKIT_MAX_TOKENS=16000\nSEMANTIC_SCHOLAR_API_KEY=s2-key\nNVIDIA_API_KEY=from-the-file\n",
+                                encoding="utf-8")
+        return next(answers)
+
+    assert wizard.menu(wizard.UI(ask=ask, out=lambda text="": None, color=False), fresh) == 0
+    assert seen == [("s2-key", "16000", "from-the-shell")] * 2            # new line and changed value seen; the shell still wins
+
+
 def test_saving_a_key_adds_env_to_the_repository_gitignore(fresh):
     (fresh.parent / ".gitignore").unlink()
     ui, printed = scripted([])

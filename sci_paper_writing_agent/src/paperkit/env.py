@@ -9,6 +9,8 @@ from pathlib import Path
 
 from dotenv import dotenv_values, set_key
 
+_FROM_FILE: dict[str, str] = {}     # what this process took from the file, so a later edit of the file can replace it
+
 
 def env_path(root: Path) -> Path:
     """<repository>/.env, where the repository is the folder that holds the project folder.
@@ -20,17 +22,22 @@ def env_path(root: Path) -> Path:
 
 
 def load_env(root: Path) -> list[str]:
-    """Loads the variables from the shared .env and returns the names it set.
+    """Loads the variables from the shared .env and returns the names it set or changed.
 
-    Empty values are ignored, so an untouched copy of .env.example changes nothing.
+    Empty values are ignored, so an untouched copy of .env.example changes nothing. A value from the shell
+    always wins. The file can be read again at any time: a line you added or changed since then is picked up.
     """
     path = env_path(root)
     if not path.is_file():
         return []
     loaded = []
     for name, value in dotenv_values(path).items():
-        if name and value and not os.environ.get(name):
-            os.environ[name] = value
+        if not name or not value:
+            continue
+        current = os.environ.get(name)
+        ours = name in _FROM_FILE and current == _FROM_FILE[name]      # set by an earlier read, untouched since
+        if not current or (ours and current != value):
+            os.environ[name] = _FROM_FILE[name] = value
             loaded.append(name)
     return loaded
 
