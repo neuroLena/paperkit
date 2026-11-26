@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, wiki, wizard
+from .ingestion import rules_ingest
 from .schemas import Issue
 from .validators import blocking
 
@@ -24,6 +25,10 @@ def _show(issues: list[Issue], as_json: bool = False) -> int:
         if not issues:
             print("ok")
     return 1 if blocking(issues) else 0
+
+
+def _say(text: str = "") -> None:
+    print(text, flush=True)                # flushed: each stage shows at once, also when the output is piped
 
 
 def _inputs_ready(root: Path, force: bool) -> bool:
@@ -65,6 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     ext = sub.add_parser("extract", help="draft facts.csv and key_messages.md from the Results section (calls the model)")
     ext.add_argument("what", nargs="?", choices=["all", "facts", "key-messages"], default="all")
     ext.add_argument("--force", action="store_true", help="replace the file even if it already has real content")
+    rul = sub.add_parser("rules", help="writing guides in .writing_guides/ -> rules for the writer and reviewer")
+    rul.add_argument("action", choices=["extract", "list", "approve", "reject"],
+                     help="extract calls the model; approve with no ids asks about each rule in turn")
+    rul.add_argument("ids", nargs="*", help="rule ids such as R3 R7, for approve and reject")
+    rul.add_argument("--all", action="store_true", help="approve every candidate")
+    rul.add_argument("--fresh", action="store_true", help="ask the model again instead of using saved answers")
     plan = sub.add_parser("plan", help="build the claim table")
     plan.add_argument("section")
     plan.add_argument("--force", action="store_true", help="call the model even if required inputs are missing")
@@ -86,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         for kind in agents.PIPELINE_AGENTS:
             agents.route(kind)
     except (ValueError, OSError) as exc:
-        if cmd in ("plan", "run", "ping", "extract"):    # the other commands do not call a model
+        if cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action == "extract"):
             print(f"Model configuration is not valid: {exc}")
             return 2
 
@@ -107,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if all(result == "ok" for *_, result in rows) else 1
     if cmd == "extract":
         return extract.run(root, args.what, args.force)
+    if cmd == "rules":
+        return rules_ingest.run(root, args.action, args.ids, args.all, args.fresh, out=_say)
     if cmd == "dry-run":
         result = dryrun.dry_run(root, args.section)
         print(dryrun.summary(result))
@@ -121,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "plan":
         if not _inputs_ready(root, args.force):
             return 1
-        table, issues = orchestrator.plan(p, args.section)
+        table, issues = orchestrator.plan(p, args.section, _say)
         print(f"{len(table.claims)} claims -> {p.claims_path(args.section)}")
         return _show(issues)
     if cmd == "approve":
@@ -129,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "run":
         if not _inputs_ready(root, args.force):
             return 1
-        result = orchestrator.run(p, args.section)
+        result = orchestrator.run(p, args.section, _say)
         for sec_id, status in result.items():
             print(f"{sec_id}: {status}")
         return 0 if all(s == "DONE" for s in result.values()) else 1

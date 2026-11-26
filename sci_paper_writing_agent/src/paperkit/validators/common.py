@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..schemas import ClaimTable, PaperSpec, SectionSpec
 
@@ -22,6 +22,7 @@ class GateContext:
     claims: ClaimTable
     facts: dict
     bib_keys: set[str]
+    rules: list = field(default_factory=list)      # approved writing rules for this section
 
 
 def headings(md: str) -> list[str]:

@@ -101,6 +101,32 @@ def test_full_loop_needs_approval_then_converges(project, tmp_path):
     assert (tmp_path / "state" / "log").exists()
 
 
+def test_each_stage_is_reported_while_it_runs(project):
+    flagged = [Issue(gate="overclaim", message="Too strong", excerpt="This suggests")]
+    agents.LLM = fake_llm([BAD, GOOD, GOOD], [flagged, []])
+    said = []
+    orchestrator.plan(project, "discussion", said.append)
+    assert said[0] == "discussion: planning, round 1 of 3" and "is building the claim table" in said[1]
+    assert "3 claims" in said[2] and said[3] == "  check    passed"
+    orchestrator.approve(project, "discussion")
+
+    said.clear()
+    assert orchestrator.run_section(project, "discussion", said.append) == "DONE"
+    text = "\n".join(said)
+    assert [row for row in said if row.startswith("discussion:")] == [f"discussion: round {n} of 3" for n in (1, 2, 3)]
+    assert "is writing the draft" in said[1] and "-> drafts/discussion.r1.md" in said[2]
+    assert "gates    13 problem(s), back to the writer:" in text and "[numbers]" in text     # round 1 stops at the gates
+    assert "... and 8 more" in text
+    assert "reviewer done in 0 s: 1 problem(s), back to the writer:" in text and "[review:overclaim] Too strong" in text
+    assert said[-1].endswith("no problems -> drafts/discussion.md")
+    assert text.index("is writing") < text.index("gates") < text.index("is reading the draft")
+
+    agents.LLM = fake_llm([BAD, BAD, BAD], [])
+    said.clear()
+    assert orchestrator.run_section(project, "discussion", said.append) == "ESCALATED"
+    assert "no rounds left" in "\n".join(said) and said[-1].endswith("-> state/reviews/discussion.open.json")
+
+
 def test_escalates_when_rounds_run_out(project):
     agents.LLM = fake_llm([BAD, BAD, BAD], [])
     orchestrator.plan(project, "discussion")

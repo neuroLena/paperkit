@@ -368,7 +368,7 @@ def test_ping_reports_each_model(project, monkeypatch, capsys):
     monkeypatch.setattr(nvidia, "post", stand_in_endpoint([]))
     assert main(["--root", str(project), "ping"]) == 0
     out = capsys.readouterr().out
-    assert "(planner, writer, facts): ok" in out and "other/model  (reviewer): ok" in out
+    assert "(planner, writer, facts, rules): ok" in out and "other/model  (reviewer): ok" in out
 
     def refuse(url, key, body):
         raise nvidia.ApiError(401, "Unauthorized")

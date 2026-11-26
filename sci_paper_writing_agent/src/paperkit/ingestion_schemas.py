@@ -95,6 +95,8 @@ class WritingRule(BaseModel):
     source_file: str
     source_page: int | None = None
     source_quote: str | None = None
+    group: str = ""
+    avoid_terms: list[str] = Field(default_factory=list)
     approved: bool = False
 
 

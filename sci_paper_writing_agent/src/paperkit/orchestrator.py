@@ -6,11 +6,13 @@ NEW -> AWAITING_APPROVAL (or CLAIMS_INVALID) -> APPROVED -> DONE (or ESCALATED)
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import yaml
 
 from . import agents, facts, wiki, zotero
+from .ingestion import rules_ingest
 from .schemas import ClaimTable, Issue, PaperSpec
 from .validators import GateContext, blocking, check_claims, run_gates
 from .validators.common import COMMENT
@@ -66,17 +68,45 @@ class Project:
         _dump(self.root / "state" / "status.json", {**self.status(), sec_id: value})
         return value
 
+    def rules(self, sec_id: str) -> list:
+        """The approved writing rules for this section, from rules/active_rules.json."""
+        sec = self.spec.section(sec_id)
+        return rules_ingest.for_section(self.root, sec.id, sec.title)
+
     def ctx(self, sec_id: str, table: ClaimTable) -> GateContext:
         return GateContext(spec=self.spec, sec=self.spec.section(sec_id), claims=table,
-                           facts=self.facts, bib_keys=set(self.bib))
+                           facts=self.facts, bib_keys=set(self.bib), rules=self.rules(sec_id))
 
 
-def plan(p: Project, sec_id: str) -> tuple[ClaimTable, list[Issue]]:
-    """Planner -> claim table. The claims gate sends its errors back to the planner."""
+def _quiet(text: str = "") -> None:
+    """The default `say`: nothing is reported."""
+
+
+def _model(kind: str) -> str:
+    return "stand-in model" if agents.LLM else agents.route(kind)[1]
+
+
+def _next(rnd: int, rounds: int, who: str) -> str:
+    return f"back to the {who}" if rnd < rounds else "no rounds left"
+
+
+def _list(say, issues: list[Issue], limit: int = 5) -> None:
+    for issue in issues[:limit]:
+        say(f"           [{issue.gate}] {' '.join(issue.message.split())[:160]}")
+    if len(issues) > limit:
+        say(f"           ... and {len(issues) - limit} more")
+
+
+def plan(p: Project, sec_id: str, say=_quiet) -> tuple[ClaimTable, list[Issue]]:
+    """Planner -> claim table. The claims gate sends its errors back to the planner. `say` gets a line per stage."""
     sec = p.spec.section(sec_id)
     issues: list[Issue] = []
     table = ClaimTable(section_id=sec_id, claims=[])
-    for _ in range(p.spec.max_rounds):
+    rounds = p.spec.max_rounds
+    for rnd in range(1, rounds + 1):
+        say(f"{sec_id}: planning, round {rnd} of {rounds}")
+        say(f"  planner  {_model('planner')} is building the claim table ...")
+        started = time.monotonic()
         claims = agents.plan_claims(
             sec, design=p.spec.design, key_messages=p.inp("key_messages"), limitations=p.inp("limitations"),
             methods=p.inp("methods"), results=p.inp("results"), introduction=p.inp("introduction"), fact_reg=p.facts,
@@ -84,8 +114,12 @@ def plan(p: Project, sec_id: str) -> tuple[ClaimTable, list[Issue]]:
             library=zotero.library_listing(p.bib), wiki_index=wiki.index(p.root / "wiki"), issues=issues)
         table = ClaimTable(section_id=sec_id, approved=False, claims=claims)
         issues = blocking(check_claims(table, p.facts, set(p.bib)))
+        say(f"  planner  done in {time.monotonic() - started:.0f} s: {len(claims)} claims")
         if not issues:
+            say("  check    passed")
             break
+        say(f"  check    {len(issues)} problem(s), {_next(rnd, rounds, 'planner')}:")
+        _list(say, issues)
     p.save_claims(table)
     p.set_status(sec_id, "CLAIMS_INVALID" if issues else "AWAITING_APPROVAL")
     return table, issues
@@ -104,15 +138,17 @@ def approve(p: Project, sec_id: str) -> list[Issue]:
     return issues
 
 
-def run_section(p: Project, sec_id: str) -> str:
-    """Writer -> gates -> reviewer, until clean or until the rounds run out."""
+def run_section(p: Project, sec_id: str, say=_quiet) -> str:
+    """Writer -> gates -> reviewer, until clean or until the rounds run out. `say` gets a line per stage."""
     sec = p.spec.section(sec_id)
     table = p.load_claims(sec_id)
     if table is None:
-        table, _ = plan(p, sec_id)
+        table, _ = plan(p, sec_id, say)
     if blocking(check_claims(table, p.facts, set(p.bib))):
+        say(f"{sec_id}: the claim table has errors, nothing was written")
         return p.set_status(sec_id, "CLAIMS_INVALID")
     if not table.approved:
+        say(f"{sec_id}: the claim table is not approved yet, nothing was written")
         return p.set_status(sec_id, "AWAITING_APPROVAL")
 
     ctx = p.ctx(sec_id, table)
@@ -120,35 +156,53 @@ def run_section(p: Project, sec_id: str) -> str:
     pages = wiki.pages_for(p.root / "wiki", [k for c in table.claims for k in c.cite_keys])
     drafts, reviews = p.root / "drafts", p.root / "state" / "reviews"
     drafts.mkdir(parents=True, exist_ok=True)
+    rules = [{"id": r.id, "instruction": r.instruction, "priority": r.priority} for r in ctx.rules]
+    if rules:
+        say(f"{sec_id}: {len(rules)} approved writing rule(s) apply")
 
-    draft, issues = "", []
-    for rnd in range(1, p.spec.max_rounds + 1):
+    draft, issues, rounds = "", [], p.spec.max_rounds
+    for rnd in range(1, rounds + 1):
+        say(f"{sec_id}: round {rnd} of {rounds}")
+        say(f"  writer   {_model('writer')} is writing the draft ...")
+        started = time.monotonic()
         draft = agents.write_section(sec, design=p.spec.design, claims=table.claims, fact_reg=fact_sub,
                                      wiki_pages=pages, prev_draft=draft, issues=issues,
-                                     starting_draft=p.draft(sec_id))
+                                     starting_draft=p.draft(sec_id), rules=rules)
         (drafts / f"{sec_id}.r{rnd}.md").write_text(draft, encoding="utf-8")
+        say(f"  writer   done in {time.monotonic() - started:.0f} s: {len(draft.split())} words "
+            f"-> drafts/{sec_id}.r{rnd}.md")
 
         gate_issues = run_gates(draft, ctx)
         issues = blocking(gate_issues)
         if issues:
             _dump(reviews / f"{sec_id}.r{rnd}.json", {"gates": _rows(gate_issues), "review": []})
+            say(f"  gates    {len(issues)} problem(s), {_next(rnd, rounds, 'writer')}:")
+            _list(say, issues)
             continue                                   # never reaches the reviewer
+        say("  gates    passed")
 
+        say(f"  reviewer {_model('reviewer')} is reading the draft ...")
+        started = time.monotonic()
         review = agents.review_section(sec, design=p.spec.design, methods=p.inp("methods"),
                                        results=p.inp("results"), claims=table.claims, fact_reg=fact_sub,
-                                       wiki_pages=pages, draft=draft)
+                                       wiki_pages=pages, draft=draft, rules=rules)
         _dump(reviews / f"{sec_id}.r{rnd}.json", {"gates": _rows(gate_issues), "review": _rows(review)})
         issues = blocking(review)
+        took = f"done in {time.monotonic() - started:.0f} s"
         if not issues:
             (drafts / f"{sec_id}.md").write_text(draft, encoding="utf-8")
+            say(f"  reviewer {took}: no problems -> drafts/{sec_id}.md")
             return p.set_status(sec_id, "DONE")
+        say(f"  reviewer {took}: {len(issues)} problem(s), {_next(rnd, rounds, 'writer')}:")
+        _list(say, issues)
 
     _dump(reviews / f"{sec_id}.open.json", _rows(issues))   # hand over to a person; never accept silently
+    say(f"{sec_id}: {len(issues)} problem(s) left after {rounds} rounds -> state/reviews/{sec_id}.open.json")
     return p.set_status(sec_id, "ESCALATED")
 
 
-def run(p: Project, only: str | None = None) -> dict[str, str]:
-    return {sec.id: run_section(p, sec.id) for sec in p.spec.sections if only in (None, sec.id)}
+def run(p: Project, only: str | None = None, say=_quiet) -> dict[str, str]:
+    return {sec.id: run_section(p, sec.id, say) for sec in p.spec.sections if only in (None, sec.id)}
 
 
 def validate(p: Project, sec_id: str, path: Path | None = None) -> list[Issue]:

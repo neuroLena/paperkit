@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from ..schemas import Issue
-from . import citations, coverage, language, numbers, structure
+from . import citations, coverage, language, numbers, structure, writing_rules
 from .claims import check_claims
 from .common import GateContext
 
-GATES = [structure, citations, numbers, language, coverage]
+GATES = [structure, citations, numbers, language, coverage, writing_rules]
 
 __all__ = ["GATES", "GateContext", "blocking", "check_claims", "run_gates"]
 

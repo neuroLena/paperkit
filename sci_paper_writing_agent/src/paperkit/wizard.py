@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, zotero
+from .ingestion import rules_ingest
 from .schemas import ClaimTable, Issue
 from .validators import blocking
 
@@ -38,6 +39,7 @@ MENU = {
     "7": "Build the paper and the report",
     "8": "Show section statuses",
     "9": "Choose the model provider and test the connection",
+    "r": "Writing rules from the guides in .writing_guides  (reading them calls the API)",
     "q": "Quit",
 }
 
@@ -446,7 +448,7 @@ def act_plan(ui: UI, root: Path) -> None:
         return
     if not _confirm_api(ui, "planner"):
         return
-    table, issues = orchestrator.plan(p, sec_id)
+    table, issues = orchestrator.plan(p, sec_id, ui.out)
     show_claims(ui, table)
     if issues:
         show_issues(ui, issues)
@@ -483,7 +485,7 @@ def act_run(ui: UI, root: Path) -> None:
         return
     if not _confirm_api(ui, "writer", "reviewer"):
         return
-    status = orchestrator.run_section(p, sec_id)
+    status = orchestrator.run_section(p, sec_id, ui.out)
     ui.out(f"{sec_id}: {status}")
     if status == "DONE":
         ui.out(f"Draft: {p.root / 'drafts' / f'{sec_id}.md'}")
@@ -546,8 +548,23 @@ def act_models(ui: UI, root: Path) -> None:
         ui.out("All models answered." if show_ping(ui) else "At least one model did not answer: see above.")
 
 
+def act_rules(ui: UI, root: Path) -> None:
+    found = rules_ingest.state(root)
+    ui.out(f"{found['guides']} guide file(s) in {rules_ingest.GUIDES}/, {found['candidates']} candidate rule(s), "
+           f"{found['approved']} approved.")
+    choice = ui.choose("What now?", {"x": "read the guides and propose rules (calls the API)",
+                                     "a": "go through the rules that are not approved yet",
+                                     "l": "list all rules", "b": "back"}, default="b")
+    if choice == "x" and _confirm_api(ui, "rules"):
+        rules_ingest.run(root, "extract", out=ui.out)
+    elif choice == "a":
+        rules_ingest.run(root, "approve", out=ui.out, ask=ui.ask)
+    elif choice == "l":
+        rules_ingest.run(root, "list", out=ui.out)
+
+
 ACTIONS = {"1": act_inputs, "2": act_dry_run, "3": act_plan, "4": act_approve,
-           "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models}
+           "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models, "r": act_rules}
 
 
 def menu(ui: UI, root: Path) -> int:

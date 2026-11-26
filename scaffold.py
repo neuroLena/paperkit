@@ -122,6 +122,25 @@ so it can be used in a hook or in CI. `paperkit status` shows the section status
 - Citations only as `[@key]`, and the key must be in `refs/library.bib` and in the claim table.
 - Wording matches the claim category: OBSERVED, INFERRED, ASSUMED, SPECULATIVE.
 
+## Writing rules from guides
+
+Put the journal's guide for authors, reporting guidelines and style guides in `.writing_guides/journal`,
+`reporting` or `general`, as PDF, `.md` or `.txt`. Then:
+
+```bash
+paperkit rules extract      # reads the guides and proposes rules -> rules/candidates.json (calls the model)
+paperkit rules approve      # asks about each rule; or: paperkit rules approve R1 R4, or --all
+paperkit rules list         # every rule with its quote and page; paperkit rules reject R4 takes one out
+```
+
+The model proposes, code checks, you approve. A rule is kept only if its quote is really in the guide, and
+the page is worked out by code. Nothing is used until you approve it: approved rules are copied to
+`rules/active_rules.json`, and the writer and reviewer get the ones for their section. A rule that bans
+specific words is also checked by code (the `rules` gate). Word limits and required headings from a guide
+still go in `paper.yaml` by hand. To correct a rule, edit `rules/candidates.json` and run `paperkit rules approve`.
+Answers are saved in `.cache/guides/`, so a second run asks the model only about new or changed guides.
+A guide goes to the model a few pages at a time: `PAPERKIT_GUIDE_WORDS` in `.env` (1500 by default) sets how much.
+
 ## Where to change things
 
 - Provider and model per agent: `config/models.yaml`, or `PAPERKIT_PROVIDER` and `PAPERKIT_MODEL`.
@@ -592,7 +611,7 @@ class Ping(BaseModel):
 def ping_all() -> list[tuple[str, str, str, str]]:
     """One tiny request per distinct provider and model in use: (agents, provider, model, 'ok' or the error)."""
     routes: dict[tuple[str, str], list[str]] = {}
-    for kind in (*PIPELINE_AGENTS, "facts"):             # facts: the model behind `paperkit extract facts`
+    for kind in (*PIPELINE_AGENTS, "facts", "rules"):    # the models behind `extract facts` and `rules extract`
         routes.setdefault(route(kind), []).append(kind)
     rows = []
     for (provider, model), kinds in routes.items():
@@ -688,7 +707,8 @@ Code checks the draft and rejects it on any violation:
   SPECULATIVE: "may", "might", "one possibility is".
 - No "novel", "first", "proves", "clearly", "robust". Never "no effect": say "we did not detect".
 - If something you need is missing, write [AUTHOR: what is missing] or [NEEDS SOURCE: what for]. Do not fill the gap yourself.
-- If <starting_draft> is given, follow it: keep text marked [KEEP] word for word (it still needs its claim tag), make the change at each [CHANGE: ...], and write each [WRITE: ...] from the claims. Never copy the markers [KEEP], [CHANGE: ...] or [WRITE: ...] into your draft."""
+- If <starting_draft> is given, follow it: keep text marked [KEEP] word for word (it still needs its claim tag), make the change at each [CHANGE: ...], and write each [WRITE: ...] from the claims. Never copy the markers [KEEP], [CHANGE: ...] or [WRITE: ...] into your draft.
+- If <writing_rules> is given, follow every rule in it: they come from the journal's and other writing guides, and the author approved them. Where one of them conflicts with the rules above, the rules above win."""
 
 OBSERVATIONAL = """
 - The design is observational: no causal wording (cause, lead to, result in, effect of, impact, drive) outside paragraphs tagged only with SPECULATIVE or ASSUMED claims."""
@@ -696,7 +716,7 @@ OBSERVATIONAL = """
 
 def write_section(sec: SectionSpec, *, design: str, claims: Sequence[Claim], fact_reg: dict,
                   wiki_pages: dict[str, str], prev_draft: str = "", issues: Sequence[Issue] = (),
-                  starting_draft: str = "") -> str:
+                  starting_draft: str = "", rules: Sequence[dict] = ()) -> str:
     system = WRITER + (OBSERVATIONAL if design == "observational" else "")
     user = "\n\n".join([
         _tag("section", _json(sec.model_dump())),
@@ -704,6 +724,8 @@ def write_section(sec: SectionSpec, *, design: str, claims: Sequence[Claim], fac
         _tag("facts", _json(fact_reg)),
         _tag("sources", "\n\n".join(f"## {k}\n{v}" for k, v in wiki_pages.items())),
     ])
+    if rules:
+        user += "\n\n" + _tag("writing_rules", _json(list(rules)))
     if starting_draft:
         user += "\n\n" + _tag("starting_draft", starting_draft)
     if prev_draft:
@@ -724,13 +746,15 @@ Report an issue with gate set to one of:
 - alternative: an obvious alternative explanation left unaddressed
 - assumption: an assumption the argument relies on but does not state
 - citation: a cited source whose page does not support the sentence; a missing page counts
+- rule: the draft breaks a rule in <writing_rules>, if that block is given. Name the rule id in the message. This one is blocking only if the rule's priority is "required". Placeholders, claim tags and [@key] citations are replaced later and never break a rule.
 
 For each issue give severity ("blocking" if the paper would be wrong or misleading, otherwise "warning"), a message saying what is wrong, and the exact sentence as excerpt.
 If the draft is sound, return an empty list."""
 
 
 def review_section(sec: SectionSpec, *, design: str, methods: str, results: str, claims: Sequence[Claim],
-                   fact_reg: dict, wiki_pages: dict[str, str], draft: str) -> list[Issue]:
+                   fact_reg: dict, wiki_pages: dict[str, str], draft: str,
+                   rules: Sequence[dict] = ()) -> list[Issue]:
     user = "\n\n".join([
         _tag("section", _json(sec.model_dump())),
         _tag("study_design", design),
@@ -739,6 +763,7 @@ def review_section(sec: SectionSpec, *, design: str, methods: str, results: str,
         _tag("claims", _json([c.model_dump() for c in claims])),
         _tag("facts", _json(fact_reg)),
         _tag("sources", "\n\n".join(f"## {k}\n{v}" for k, v in wiki_pages.items())),
+        *([_tag("writing_rules", _json(list(rules)))] if rules else []),
         _tag("draft", draft),
     ])
     review = _ask("reviewer", REVIEWER, user, Review)
@@ -771,11 +796,11 @@ FILES['src/paperkit/validators/__init__.py'] = r'''
 from __future__ import annotations
 
 from ..schemas import Issue
-from . import citations, coverage, language, numbers, structure
+from . import citations, coverage, language, numbers, structure, writing_rules
 from .claims import check_claims
 from .common import GateContext
 
-GATES = [structure, citations, numbers, language, coverage]
+GATES = [structure, citations, numbers, language, coverage, writing_rules]
 
 __all__ = ["GATES", "GateContext", "blocking", "check_claims", "run_gates"]
 
@@ -799,7 +824,7 @@ FILES['src/paperkit/validators/common.py'] = r'''
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..schemas import ClaimTable, PaperSpec, SectionSpec
 
@@ -819,6 +844,7 @@ class GateContext:
     claims: ClaimTable
     facts: dict
     bib_keys: set[str]
+    rules: list = field(default_factory=list)      # approved writing rules for this section
 
 
 def headings(md: str) -> list[str]:
@@ -1331,6 +1357,7 @@ from pathlib import Path
 import yaml
 
 from . import agents, facts, wiki, zotero
+from .ingestion import rules_ingest
 from .schemas import ClaimTable, Issue, PaperSpec
 from .validators import GateContext, blocking, check_claims, run_gates
 from .validators.common import COMMENT
@@ -1386,9 +1413,14 @@ class Project:
         _dump(self.root / "state" / "status.json", {**self.status(), sec_id: value})
         return value
 
+    def rules(self, sec_id: str) -> list:
+        """The approved writing rules for this section, from rules/active_rules.json."""
+        sec = self.spec.section(sec_id)
+        return rules_ingest.for_section(self.root, sec.id, sec.title)
+
     def ctx(self, sec_id: str, table: ClaimTable) -> GateContext:
         return GateContext(spec=self.spec, sec=self.spec.section(sec_id), claims=table,
-                           facts=self.facts, bib_keys=set(self.bib))
+                           facts=self.facts, bib_keys=set(self.bib), rules=self.rules(sec_id))
 
 
 def _quiet(text: str = "") -> None:
@@ -1469,6 +1501,9 @@ def run_section(p: Project, sec_id: str, say=_quiet) -> str:
     pages = wiki.pages_for(p.root / "wiki", [k for c in table.claims for k in c.cite_keys])
     drafts, reviews = p.root / "drafts", p.root / "state" / "reviews"
     drafts.mkdir(parents=True, exist_ok=True)
+    rules = [{"id": r.id, "instruction": r.instruction, "priority": r.priority} for r in ctx.rules]
+    if rules:
+        say(f"{sec_id}: {len(rules)} approved writing rule(s) apply")
 
     draft, issues, rounds = "", [], p.spec.max_rounds
     for rnd in range(1, rounds + 1):
@@ -1477,7 +1512,7 @@ def run_section(p: Project, sec_id: str, say=_quiet) -> str:
         started = time.monotonic()
         draft = agents.write_section(sec, design=p.spec.design, claims=table.claims, fact_reg=fact_sub,
                                      wiki_pages=pages, prev_draft=draft, issues=issues,
-                                     starting_draft=p.draft(sec_id))
+                                     starting_draft=p.draft(sec_id), rules=rules)
         (drafts / f"{sec_id}.r{rnd}.md").write_text(draft, encoding="utf-8")
         say(f"  writer   done in {time.monotonic() - started:.0f} s: {len(draft.split())} words "
             f"-> drafts/{sec_id}.r{rnd}.md")
@@ -1495,7 +1530,7 @@ def run_section(p: Project, sec_id: str, say=_quiet) -> str:
         started = time.monotonic()
         review = agents.review_section(sec, design=p.spec.design, methods=p.inp("methods"),
                                        results=p.inp("results"), claims=table.claims, fact_reg=fact_sub,
-                                       wiki_pages=pages, draft=draft)
+                                       wiki_pages=pages, draft=draft, rules=rules)
         _dump(reviews / f"{sec_id}.r{rnd}.json", {"gates": _rows(gate_issues), "review": _rows(review)})
         issues = blocking(review)
         took = f"done in {time.monotonic() - started:.0f} s"
@@ -1546,6 +1581,7 @@ import sys
 from pathlib import Path
 
 from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, wiki, wizard
+from .ingestion import rules_ingest
 from .schemas import Issue
 from .validators import blocking
 
@@ -1605,6 +1641,12 @@ def main(argv: list[str] | None = None) -> int:
     ext = sub.add_parser("extract", help="draft facts.csv and key_messages.md from the Results section (calls the model)")
     ext.add_argument("what", nargs="?", choices=["all", "facts", "key-messages"], default="all")
     ext.add_argument("--force", action="store_true", help="replace the file even if it already has real content")
+    rul = sub.add_parser("rules", help="writing guides in .writing_guides/ -> rules for the writer and reviewer")
+    rul.add_argument("action", choices=["extract", "list", "approve", "reject"],
+                     help="extract calls the model; approve with no ids asks about each rule in turn")
+    rul.add_argument("ids", nargs="*", help="rule ids such as R3 R7, for approve and reject")
+    rul.add_argument("--all", action="store_true", help="approve every candidate")
+    rul.add_argument("--fresh", action="store_true", help="ask the model again instead of using saved answers")
     plan = sub.add_parser("plan", help="build the claim table")
     plan.add_argument("section")
     plan.add_argument("--force", action="store_true", help="call the model even if required inputs are missing")
@@ -1626,7 +1668,7 @@ def main(argv: list[str] | None = None) -> int:
         for kind in agents.PIPELINE_AGENTS:
             agents.route(kind)
     except (ValueError, OSError) as exc:
-        if cmd in ("plan", "run", "ping", "extract"):    # the other commands do not call a model
+        if cmd in ("plan", "run", "ping", "extract") or (cmd == "rules" and args.action == "extract"):
             print(f"Model configuration is not valid: {exc}")
             return 2
 
@@ -1647,6 +1689,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if all(result == "ok" for *_, result in rows) else 1
     if cmd == "extract":
         return extract.run(root, args.what, args.force)
+    if cmd == "rules":
+        return rules_ingest.run(root, args.action, args.ids, args.all, args.fresh, out=_say)
     if cmd == "dry-run":
         result = dryrun.dry_run(root, args.section)
         print(dryrun.summary(result))
@@ -1874,12 +1918,476 @@ FILES['src/paperkit/ingestion/__init__.py'] = '\n"""Document ingestion component
 FILES['src/paperkit/ingestion/pdf_parser.py'] = '\n"""Extract page-level text; requires the optional PyMuPDF package."""\nfrom pathlib import Path\n\n\ndef parse_pdf(path: Path) -> list[dict]:\n    import pymupdf\n    with pymupdf.open(path) as doc:\n        return [{"source": str(path), "page": i + 1, "text": page.get_text()}\n                for i, page in enumerate(doc)]\n'
 FILES['src/paperkit/ingestion/table_parser.py'] = '\n"""Read CSV/TSV cells without converting or rounding numeric strings."""\nimport csv\nfrom pathlib import Path\n\n\ndef read_table(path: Path) -> list[dict]:\n    if path.suffix.lower() not in {".csv", ".tsv"}:\n        raise ValueError("Expected CSV or TSV")\n    with path.open(encoding="utf-8-sig", newline="") as f:\n        reader = csv.DictReader(f, delimiter="\\t" if path.suffix.lower() == ".tsv" else ",")\n        return list(reader)\n'
 FILES['src/paperkit/ingestion/literature_ingest.py'] = '\n"""Reserved for PDF discovery, Zotero matching and evidence extraction; not implemented yet."""\n'
-FILES['src/paperkit/ingestion/rules_ingest.py'] = '\n"""Reserved for guideline extraction and approval; not implemented yet."""\n'
-FILES['src/paperkit/ingestion/facts_ingest.py'] = '\n"""Reserved for manifest-driven fact extraction and approval; not implemented yet."""\n'
-FILES['src/paperkit/validators/writing_rules.py'] = '\n"""Reserved for approved writing-rule validation; not registered as a gate yet."""\n'
+FILES['src/paperkit/ingestion/rules_ingest.py'] = r'''
+"""Writing guides -> writing rules.
 
-FILES['src/paperkit/ingestion_schemas.py'] = '\n"""Additional schemas for ingestion. Not yet connected to the original pipeline."""\nfrom typing import Literal\nfrom pydantic import BaseModel, Field\nfrom decimal import Decimal\n\n\nclass ScientificFact(BaseModel):\n    id: str\n    text: str\n    analysis: str | None = None\n    outcome: str | None = None\n    predictor: str | None = None\n    modality: str | None = None\n    model: str | None = None\n    sample: str | None = None\n    fold: str | None = None\n    metric: str\n    value: Decimal\n    ci_lower: Decimal | None = None\n    ci_upper: Decimal | None = None\n    confidence_level: Decimal | None = None\n    n: int | None = None\n    unit: str | None = None\n    source_file: str\n    source_row: int | None = None\n    source_column: str | None = None\n    source_sha256: str | None = None\n    approved: bool = False\n\n\nclass MetricSpec(BaseModel):\n    column: str\n    meaning: str\n    unit: str | None = None\n\n\nclass TableSpec(BaseModel):\n    id: str\n    file: str\n    title: str\n    analysis: str\n    grouping_columns: list[str] = Field(default_factory=list)\n    metrics: list[MetricSpec] = Field(default_factory=list)\n\n\nclass TableManifest(BaseModel):\n    tables: list[TableSpec] = Field(default_factory=list)\n\n\nclass SourceDocument(BaseModel):\n    path: str\n    sha256: str\n    citation_key: str | None = None\n    doi: str | None = None\n\n\nclass EvidenceItem(BaseModel):\n    id: str\n    citation_key: str\n    statement: str\n    quotation: str\n    page: int | None = None\n    section: str | None = None\n    verified: bool = False\n\n\nclass LiteratureRecord(BaseModel):\n    source: SourceDocument\n    question: str = ""\n    study_design: str = ""\n    population: str = ""\n    methods: str = ""\n    limitations: list[str] = Field(default_factory=list)\n    evidence: list[EvidenceItem] = Field(default_factory=list)\n\n\nclass ConceptRecord(BaseModel):\n    name: str\n    synthesis: str\n    supporting_evidence_ids: list[str] = Field(default_factory=list)\n    contradicting_evidence_ids: list[str] = Field(default_factory=list)\n    unresolved_questions: list[str] = Field(default_factory=list)\n\n\nclass WritingRule(BaseModel):\n    id: str\n    category: Literal["structure", "argumentation", "language", "statistics", "reporting", "citations", "formatting", "scientific_reasoning"]\n    instruction: str\n    rationale: str = ""\n    sections: list[str] = Field(default_factory=lambda: ["all"])\n    study_designs: list[str] = Field(default_factory=lambda: ["all"])\n    priority: Literal["required", "recommended", "optional"]\n    severity: Literal["blocking", "warning"]\n    validation_method: Literal["python", "ai", "human", "hybrid"]\n    source_file: str\n    source_page: int | None = None\n    source_quote: str | None = None\n    approved: bool = False\n\n\nclass RuleSet(BaseModel):\n    name: str\n    version: str = "1.0"\n    rules: list[WritingRule] = Field(default_factory=list)\n\n\nclass AgentConfig(BaseModel):\n    provider: str = "anthropic"\n    model: str | None = None\n    max_tokens: int = 8000\n\n\nclass AgentRun(BaseModel):\n    agent: str\n    model: str\n    status: str\n    input_tokens: int | None = None\n    output_tokens: int | None = None\n'
-FILES['docs/ingestion.md'] = '\n# Extended ingestion layout\n\nPlace literature PDFs in `.papers/` and writing guides in `.writing_guides/`.\nUse CSV/TSV tables in `inputs/tables/` and describe them in `manifest.yaml`.\nThe new schemas live in `ingestion_schemas.py`; the existing schemas.py re-exports them for fresh projects.\nExisting projects can import directly from ingestion_schemas without modifying schemas.py.\nCandidate facts go in facts/candidates.json; the original facts/facts.json and inputs/facts.csv remain compatible with the existing CLI.\nThe new registries are templates, not automatically populated. The PDF and table readers are basic utilities; agent ingestion, approvals, configuration loading and new CLI commands are not implemented.\nThe original wiki reads wiki/<citation-key>.md; wiki/sources and wiki/concepts are reserved for future migration.\nInstall PDF parsing support with python -m pip install pymupdf.\n'
+PDF, .md or .txt files in .writing_guides/ (general/, journal/, reporting/) become rules for the writer and reviewer.
+The model proposes; code verifies; a person approves:
+- each guide is read page by page and sent to the `rules` agent a few pages at a time;
+- a proposed rule is kept only if its quote is really in those pages (the same letters and digits in the same
+  order), and its page is worked out here, never by the model;
+- kept rules go to rules/candidates.json with approved set to false. Only approved rules, which are copied to
+  rules/active_rules.json, ever reach the writer, the reviewer and the gate;
+- every answered part is saved in .cache/guides/, so a run that failed half way continues where it stopped.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import unicodedata
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, Field
+
+from .. import agents
+from ..ingestion_schemas import WritingRule
+
+GUIDES = ".writing_guides"
+SUFFIXES = (".pdf", ".md", ".txt")
+CATEGORIES = ("structure", "argumentation", "language", "statistics", "reporting", "citations", "formatting",
+              "scientific_reasoning")
+PRIORITIES = ("required", "recommended", "optional")
+MIN_QUOTE_WORDS = 3
+NONE_YET = f"No rules yet. Put the guides in {GUIDES}/ and run: paperkit rules extract"
+
+PROMPT = """You read part of a writing guide (a journal's instructions for authors, a reporting guideline or a style guide) and list the rules that say how the TEXT of a scientific paper must be written. You write no prose.
+
+For each rule return:
+- instruction: one short imperative sentence a writer can follow, in your own words. One rule per instruction.
+- quote: the passage of the guide that states the rule, copied character for character. One continuous passage of 5 to 60 words: no "...", and never two places joined together.
+- category: structure, argumentation, language, statistics, reporting, citations, formatting or scientific_reasoning.
+- sections: the sections of a paper it applies to, in lower case, such as ["abstract"], ["methods"] or ["discussion"]; ["all"] if it applies everywhere. Prefer the names in <paper_sections>.
+- priority: "required" if the guide says must, required, never or always; "recommended" if it says should; otherwise "optional".
+- avoid_terms: only when the rule bans specific words or phrases, those words exactly as they appear in your quote; otherwise an empty list.
+
+Leave out everything that is not about writing the text: submission and upload steps, fees, file formats and image resolution, cover letters, authorship and ethics forms, copyright, the review process, contact details.
+Never invent a rule. If these pages hold no writing rule, return an empty list. Return at most 15 rules."""
+
+
+class ProposedRule(BaseModel):
+    instruction: str = Field(description="One short imperative sentence a writer can follow")
+    quote: str = Field(description="The passage of the guide that states it, copied character for character")
+    category: str = Field(default="language", description="One of: " + ", ".join(CATEGORIES))
+    sections: list[str] = Field(default_factory=lambda: ["all"], description='Paper sections in lower case, or ["all"]')
+    priority: str = Field(default="recommended", description="required, recommended or optional")
+    avoid_terms: list[str] = Field(default_factory=list, description="Banned words or phrases, exactly as in the quote")
+
+
+class RuleList(BaseModel):
+    rules: list[ProposedRule] = Field(default_factory=list)
+
+
+# ------------------------------------------------------------------ reading
+
+def _key(text: str) -> str:
+    """Letters and digits only, in lower case. Quotes are compared on this, so the line breaks, hyphens
+    and quote marks of a PDF do not matter, but every word must be there in the same order."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text).casefold() if ch.isalnum())
+
+
+def _short(text: object, limit: int = 200) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def clean(text: str) -> str:
+    """Page text as running text: a word split over a line break is joined, and lines become sentences."""
+    text = unicodedata.normalize("NFKC", text).replace("­", "")
+    text = re.sub(r"(?<=\w)-\n(?=[a-z])", "", text)
+    blocks = (" ".join(block.split()) for block in re.split(r"\n[ \t]*\n", text))
+    return "\n\n".join(block for block in blocks if block)
+
+
+def guide_files(root: str | Path) -> list[Path]:
+    folder = Path(root) / GUIDES
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in SUFFIXES)
+
+
+def read_guide(path: Path) -> list[tuple[int, str]]:
+    """(page number, text) for every page that has text. A .md or .txt file is one page unless it holds form feeds."""
+    if path.suffix.lower() == ".pdf":
+        try:
+            from .pdf_parser import parse_pdf
+
+            raw = [(page["page"], page["text"]) for page in parse_pdf(path)]
+        except ImportError:
+            raise RuntimeError("reading a PDF needs PyMuPDF: pip install pymupdf") from None
+    else:
+        raw = list(enumerate(path.read_text(encoding="utf-8-sig").split("\f"), 1))
+    pages = [(number, clean(text)) for number, text in raw]
+    return [(number, text) for number, text in pages if text]
+
+
+def parts(pages: list[tuple[int, str]], limit: int) -> list[list[tuple[int, str]]]:
+    """Consecutive pages grouped into parts of about `limit` words, so no request is long. A page is never cut."""
+    out, current, size = [], [], 0
+    for page in pages:
+        words = len(page[1].split())
+        if current and size + words > limit:
+            out.append(current)
+            current, size = [], 0
+        current.append(page)
+        size += words
+    return out + ([current] if current else [])
+
+
+def section_ids(root: str | Path) -> list[str]:
+    try:
+        raw = yaml.safe_load((Path(root) / "paper.yaml").read_text(encoding="utf-8")) or {}
+        return [str(sec["id"]).lower() for sec in raw.get("sections", []) if isinstance(sec, dict) and sec.get("id")]
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------------ the two rule files
+
+def _file(root: str | Path, name: str) -> Path:
+    return Path(root) / "rules" / f"{name}.json"
+
+
+def load(root: str | Path, name: str = "candidates") -> list[WritingRule]:
+    """rules/<name>.json as rules. A missing or empty file is an empty list; a broken one is an error."""
+    path = _file(root, name)
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if not text.strip():
+        return []
+    try:
+        raw = json.loads(text)
+        if not isinstance(raw, list):
+            raise ValueError("it must be a list of rules")
+        return [WritingRule.model_validate(item) for item in raw]
+    except ValueError as exc:                  # also covers a JSON error and a rule that does not fit the schema
+        raise ValueError(f"rules/{name}.json is not valid: {_short(exc)}") from None
+
+
+def save(root: str | Path, rules: list[WritingRule]) -> None:
+    """Writes rules/candidates.json, and rules/active_rules.json with the approved rules only."""
+    for name, rows in (("candidates", rules), ("active_rules", [r for r in rules if r.approved])):
+        path = _file(root, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps([r.model_dump() for r in rows], ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+
+
+def for_section(root: str | Path, sec_id: str, title: str = "") -> list[WritingRule]:
+    """The approved rules that apply to one section: its own and those for all sections."""
+    names = {"all", sec_id.lower(), title.lower()}
+    return [r for r in load(root, "active_rules") if r.approved and names & {s.lower() for s in r.sections}]
+
+
+def state(root: str | Path) -> dict:
+    try:
+        rules = load(root)
+    except ValueError:
+        rules = []
+    return {"guides": len(guide_files(root)), "candidates": len(rules), "approved": sum(r.approved for r in rules)}
+
+
+# ------------------------------------------------------------------ checking a proposal
+
+def _same(rule: WritingRule) -> tuple[str, str, str]:
+    return rule.source_file, _key(rule.source_quote or ""), _key(rule.instruction)
+
+
+def _page(quote: str, pages: list[tuple[int, str]]) -> int | None:
+    """The page that holds the quote, or None if it is not in these pages."""
+    wanted = _key(quote)
+    keys = [(number, _key(text)) for number, text in pages]
+    for number, key in keys:
+        if wanted in key:
+            return number
+    for (number, first), (_, second) in zip(keys, keys[1:]):
+        if wanted in first + second:
+            return number                      # the passage runs over a page break
+    return None
+
+
+def verify(raw: dict, pages: list[tuple[int, str]], source: str, group: str) -> WritingRule | str:
+    """A rule built from one proposal, or the reason it was left out. Nothing is taken on trust:
+    the quote must be in the pages, and a banned term must be in the quote."""
+    instruction = " ".join(str(raw.get("instruction") or "").split())
+    quote = " ".join(unicodedata.normalize("NFKC", str(raw.get("quote") or "")).split())
+    if not instruction:
+        return "a proposal with no instruction"
+    if len(quote.split()) < MIN_QUOTE_WORDS:
+        return f"{_short(instruction, 90)} (its quote is too short to check)"
+    page = _page(quote, pages)
+    if page is None:
+        return f"{_short(instruction, 90)} (its quote is not in the guide)"
+    category = str(raw.get("category") or "").strip().lower().replace(" ", "_")
+    priority = str(raw.get("priority") or "").strip().lower()
+    priority = priority if priority in PRIORITIES else "recommended"
+    sections = [" ".join(str(s).lower().split()) for s in raw.get("sections") or [] if str(s).strip()]
+    terms: list[str] = []
+    for term in raw.get("avoid_terms") or []:
+        term = " ".join(unicodedata.normalize("NFKC", str(term)).split()).strip("\"'“”‘’.,;:")
+        in_quote = re.search(rf"(?<!\w){re.escape(term)}(?!\w)", quote, re.IGNORECASE) if term else None
+        if len(term) >= 2 and len(term.split()) <= 6 and in_quote and term.lower() not in [t.lower() for t in terms]:
+            terms.append(term)
+    return WritingRule(
+        id="", category=category if category in CATEGORIES else "language", instruction=instruction,
+        sections=sections or ["all"], priority=priority, severity="blocking" if priority == "required" else "warning",
+        validation_method="python" if terms else "ai", source_file=source, source_page=page, source_quote=quote,
+        group=group, avoid_terms=terms, approved=False)
+
+
+# ------------------------------------------------------------------ guides -> candidates
+
+def extract(root: str | Path, fresh: bool = False, say=lambda text: None) -> dict:
+    """Reads every guide, asks the model part by part and writes rules/candidates.json.
+
+    A rule that is already a candidate is left exactly as it is, with its id, your edits and its approval.
+    `fresh` asks the model again instead of using the answers saved in .cache/guides/.
+    """
+    root = Path(root)
+    files = guide_files(root)
+    if not files:
+        raise ValueError(f"No guides found. Put PDF, .md or .txt files in {GUIDES}/journal, "
+                         f"{GUIDES}/reporting or {GUIDES}/general.")
+    old = load(root)
+    sections = section_ids(root)
+    limit = int(os.environ.get("PAPERKIT_GUIDE_WORDS") or "1500")
+    agents.LOG_DIR = root / "state" / "log"
+    found: list[WritingRule] = []
+    seen: set[tuple[str, str, str]] = set()
+    dropped: list[str] = []
+    failed: list[str] = []
+    unread: set[str] = set()                   # guides that were not read in full this time
+
+    for path in files:
+        source = path.relative_to(root).as_posix()
+        inner = path.relative_to(root / GUIDES).parts
+        group = inner[0] if len(inner) > 1 else "general"
+        try:
+            pages = read_guide(path)
+        except Exception as exc:
+            failed.append(f"{source}: {_short(exc)}")
+            unread.add(source)
+            continue
+        if not pages:
+            failed.append(f"{source}: no text in it (a scanned PDF needs OCR first)")
+            continue
+        chunks = parts(pages, limit)
+        for number, chunk in enumerate(chunks, 1):
+            span = f"page {chunk[0][0]}" if len(chunk) == 1 else f"pages {chunk[0][0]}-{chunk[-1][0]}"
+            where = f"rules: {source}, part {number} of {len(chunks)} ({span})"
+            text = "\n\n".join(f"[page {page}]\n{body}" for page, body in chunk)
+            digest = hashlib.sha256(json.dumps([PROMPT, sections, text]).encode("utf-8")).hexdigest()[:24]
+            cache = root / ".cache" / "guides" / f"{digest}.json"
+            proposed = None
+            if cache.is_file() and not fresh:
+                try:
+                    proposed = json.loads(cache.read_text(encoding="utf-8"))
+                except ValueError:
+                    proposed = None
+            if proposed is not None:
+                say(f"{where}: answer kept from an earlier run")
+            else:
+                say(f"{where}: asking the model, {len(text.split())} words ...")
+                user = (agents._tag("paper_sections", ", ".join(sections) or "(none listed)") + "\n\n"
+                        + agents._tag("guide", text))
+                try:
+                    proposed = [rule.model_dump() for rule in agents._ask("rules", PROMPT, user, RuleList).rules]
+                except Exception as exc:       # a provider error: keep going, this part is asked again next time
+                    failed.append(f"{source}, {span}: {type(exc).__name__}: {_short(exc)}")
+                    unread.add(source)
+                    continue
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps(proposed, ensure_ascii=False), encoding="utf-8")
+            for raw in proposed:
+                rule = verify(raw, chunk, source, group) if isinstance(raw, dict) else "a proposal that is not a rule"
+                if isinstance(rule, str):
+                    dropped.append(f"{source}, {span}: {rule}")
+                elif _same(rule) not in seen:
+                    seen.add(_same(rule))
+                    found.append(rule)
+
+    by_rule = {_same(r): r for r in old}
+    by_quote: dict[tuple[str, str], list[WritingRule]] = {}
+    for rule in old:
+        by_quote.setdefault((rule.source_file, _key(rule.source_quote or "")), []).append(rule)
+    number = max([int(r.id[1:]) for r in old if re.fullmatch(r"R\d+", r.id)] or [0])
+    reused: set[int] = set()
+    already: dict[int, WritingRule] = {}       # position in `found` -> the candidate it already is
+    for position, rule in enumerate(found):
+        before = by_rule.get(_same(rule))
+        if before is not None:
+            reused.add(id(before))
+            already[position] = before
+    for position, rule in enumerate(found):    # the same passage with an instruction you have edited
+        if position not in already:
+            same_quote = [r for r in by_quote.get((rule.source_file, _key(rule.source_quote or "")), [])
+                          if id(r) not in reused]
+            if len(same_quote) == 1:
+                reused.add(id(same_quote[0]))
+                already[position] = same_quote[0]
+    final: list[WritingRule] = []
+    new = 0
+    for position, rule in enumerate(found):
+        if position in already:
+            final.append(already[position])
+        else:
+            number, new = number + 1, new + 1
+            rule.id = f"R{number}"
+            final.append(rule)
+    for rule in old:                           # rules you added by hand, and those of a guide not read in full
+        by_hand = not rule.source_file.startswith(GUIDES + "/")
+        if id(rule) not in reused and (by_hand or rule.source_file in unread):
+            final.append(rule)
+    final.sort(key=lambda r: int(r.id[1:]) if re.fullmatch(r"R\d+", r.id) else 10 ** 9)
+    save(root, final)
+    return {"files": len(files), "rules": final, "new": new, "dropped": dropped, "failed": failed}
+
+
+# ------------------------------------------------------------------ approval
+
+def set_approved(root: str | Path, ids, value: bool) -> list[WritingRule]:
+    rules = load(root)
+    wanted = {str(i).upper() for i in ids}
+    unknown = sorted(wanted - {r.id.upper() for r in rules})
+    if unknown:
+        raise ValueError(f"No such rule: {', '.join(unknown)}. `paperkit rules list` shows the ids.")
+    for rule in rules:
+        if rule.id.upper() in wanted:
+            rule.approved = value
+    save(root, rules)
+    return [r for r in rules if r.id.upper() in wanted]
+
+
+def show(rule: WritingRule) -> list[str]:
+    where = rule.source_file + (f", p. {rule.source_page}" if rule.source_page else "")
+    rows = [f"[{'x' if rule.approved else ' '}] {rule.id}  {rule.priority}, {', '.join(rule.sections)}: {rule.instruction}",
+            f'      "{_short(rule.source_quote or "", 220)}"  ({where})']
+    if rule.avoid_terms:
+        rows.append(f"      code will flag: {', '.join(rule.avoid_terms)}")
+    return rows
+
+
+def review(root: str | Path, ask=input, out=print) -> int:
+    """Walks through the candidates that are not approved yet. Returns how many were approved."""
+    rules = load(root)
+    waiting = [r for r in rules if not r.approved]
+    count = 0
+    try:
+        for number, rule in enumerate(waiting, 1):
+            out("")
+            out(f"Rule {number} of {len(waiting)}")
+            for row in show(rule):
+                out(row)
+            answer = ask("[y] approve  [n] leave out  [a] approve this and all the rest  [q] stop > ").strip().lower()[:1]
+            if answer == "a":
+                for rest in waiting[number - 1:]:
+                    rest.approved = True
+                count += len(waiting) - number + 1
+                break
+            if answer == "q":
+                break
+            if answer == "y":
+                rule.approved = True
+                count += 1
+    except EOFError:
+        pass
+    finally:
+        save(root, rules)                      # whatever was decided so far is kept
+    return count
+
+
+# ------------------------------------------------------------------ `paperkit rules`
+
+def run(root: str | Path, action: str = "list", ids=(), everything: bool = False, fresh: bool = False,
+        out=print, ask=input) -> int:
+    """extract | list | approve | reject. Exit code 1 if something failed."""
+    root = Path(root)
+    try:
+        if action == "extract":
+            got = extract(root, fresh, out)
+            approved = sum(r.approved for r in got["rules"])
+            out(f"rules: {len(got['rules'])} candidate(s) from {got['files']} guide file(s) -> rules/candidates.json "
+                f"({got['new']} new, {approved} approved)")
+            for row in got["dropped"][:10]:
+                out(f"  left out: {row}")
+            if len(got["dropped"]) > 10:
+                out(f"  ... and {len(got['dropped']) - 10} more left out")
+            for row in got["failed"]:
+                out(f"  failed: {row}")
+            if got["failed"]:
+                out("Run it again for what failed: finished parts are kept and are not asked again.")
+            if len(got["rules"]) > approved:
+                out("Nothing is used until you approve it: paperkit rules approve")
+            return 1 if got["failed"] else 0
+
+        rules = load(root)
+        if action == "list":
+            if not rules:
+                out(NONE_YET)
+                return 0
+            for rule in rules:
+                for row in show(rule):
+                    out(row)
+            out(f"{sum(r.approved for r in rules)} of {len(rules)} approved. Approved rules are in rules/active_rules.json.")
+            return 0
+        if not rules:
+            out(NONE_YET)
+            return 1
+        if action == "reject":
+            if not ids:
+                out("Name the rules to take out, for example: paperkit rules reject R3 R7")
+                return 1
+            out(f"{len(set_approved(root, ids, False))} rule(s) taken out.")
+        elif everything:
+            for rule in rules:
+                rule.approved = True
+            save(root, rules)
+            out(f"All {len(rules)} rule(s) approved.")
+        elif ids:
+            out(f"{len(set_approved(root, ids, True))} rule(s) approved.")
+        else:
+            out(f"{review(root, ask, out)} rule(s) approved.")
+        active = len(load(root, "active_rules"))
+        out(f"{active} rule(s) in rules/active_rules.json: the writer and reviewer get the ones for their section.")
+        return 0
+    except (ValueError, RuntimeError, OSError) as exc:
+        out(f"rules: {type(exc).__name__}: {_short(exc, 300)}")
+        return 1
+'''
+FILES['src/paperkit/ingestion/facts_ingest.py'] = '\n"""Reserved for manifest-driven fact extraction and approval; not implemented yet."""\n'
+FILES['src/paperkit/validators/writing_rules.py'] = r'''
+"""Writing rules: approved rules that ban specific words or phrases are checked here, in code.
+
+The other approved rules are for the writer and the reviewer, who get them with the section.
+"""
+from __future__ import annotations
+
+import re
+
+from ..schemas import Issue
+from .common import COMMENT, GateContext, paragraphs, short
+
+
+def check(draft: str, ctx: GateContext) -> list[Issue]:
+    rules = [rule for rule in ctx.rules if rule.avoid_terms]
+    issues: list[Issue] = []
+    if not rules:
+        return issues
+    for raw, _ in paragraphs(draft):
+        text = COMMENT.sub("", raw)
+        for term in ctx.spec.term_whitelist:
+            text = re.sub(re.escape(term), "", text, flags=re.IGNORECASE)
+        for rule in rules:
+            for term in rule.avoid_terms:
+                if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, re.IGNORECASE):
+                    issues.append(Issue(gate="rules", severity=rule.severity, excerpt=short(text),
+                                        message=f"{rule.id}: avoid '{term}' ({rule.instruction})"))
+    return issues
+'''
+
+FILES['src/paperkit/ingestion_schemas.py'] = '\n"""Additional schemas for ingestion. Not yet connected to the original pipeline."""\nfrom typing import Literal\nfrom pydantic import BaseModel, Field\nfrom decimal import Decimal\n\n\nclass ScientificFact(BaseModel):\n    id: str\n    text: str\n    analysis: str | None = None\n    outcome: str | None = None\n    predictor: str | None = None\n    modality: str | None = None\n    model: str | None = None\n    sample: str | None = None\n    fold: str | None = None\n    metric: str\n    value: Decimal\n    ci_lower: Decimal | None = None\n    ci_upper: Decimal | None = None\n    confidence_level: Decimal | None = None\n    n: int | None = None\n    unit: str | None = None\n    source_file: str\n    source_row: int | None = None\n    source_column: str | None = None\n    source_sha256: str | None = None\n    approved: bool = False\n\n\nclass MetricSpec(BaseModel):\n    column: str\n    meaning: str\n    unit: str | None = None\n\n\nclass TableSpec(BaseModel):\n    id: str\n    file: str\n    title: str\n    analysis: str\n    grouping_columns: list[str] = Field(default_factory=list)\n    metrics: list[MetricSpec] = Field(default_factory=list)\n\n\nclass TableManifest(BaseModel):\n    tables: list[TableSpec] = Field(default_factory=list)\n\n\nclass SourceDocument(BaseModel):\n    path: str\n    sha256: str\n    citation_key: str | None = None\n    doi: str | None = None\n\n\nclass EvidenceItem(BaseModel):\n    id: str\n    citation_key: str\n    statement: str\n    quotation: str\n    page: int | None = None\n    section: str | None = None\n    verified: bool = False\n\n\nclass LiteratureRecord(BaseModel):\n    source: SourceDocument\n    question: str = ""\n    study_design: str = ""\n    population: str = ""\n    methods: str = ""\n    limitations: list[str] = Field(default_factory=list)\n    evidence: list[EvidenceItem] = Field(default_factory=list)\n\n\nclass ConceptRecord(BaseModel):\n    name: str\n    synthesis: str\n    supporting_evidence_ids: list[str] = Field(default_factory=list)\n    contradicting_evidence_ids: list[str] = Field(default_factory=list)\n    unresolved_questions: list[str] = Field(default_factory=list)\n\n\nclass WritingRule(BaseModel):\n    id: str\n    category: Literal["structure", "argumentation", "language", "statistics", "reporting", "citations", "formatting", "scientific_reasoning"]\n    instruction: str\n    rationale: str = ""\n    sections: list[str] = Field(default_factory=lambda: ["all"])\n    study_designs: list[str] = Field(default_factory=lambda: ["all"])\n    priority: Literal["required", "recommended", "optional"]\n    severity: Literal["blocking", "warning"]\n    validation_method: Literal["python", "ai", "human", "hybrid"]\n    source_file: str\n    source_page: int | None = None\n    source_quote: str | None = None\n    group: str = ""\n    avoid_terms: list[str] = Field(default_factory=list)\n    approved: bool = False\n\n\nclass RuleSet(BaseModel):\n    name: str\n    version: str = "1.0"\n    rules: list[WritingRule] = Field(default_factory=list)\n\n\nclass AgentConfig(BaseModel):\n    provider: str = "anthropic"\n    model: str | None = None\n    max_tokens: int = 8000\n\n\nclass AgentRun(BaseModel):\n    agent: str\n    model: str\n    status: str\n    input_tokens: int | None = None\n    output_tokens: int | None = None\n'
+FILES['docs/ingestion.md'] = '\n# Extended ingestion layout\n\nPlace literature PDFs in `.papers/` and writing guides in `.writing_guides/`.\nUse CSV/TSV tables in `inputs/tables/` and describe them in `manifest.yaml`.\nThe new schemas live in `ingestion_schemas.py`; the existing schemas.py re-exports them for fresh projects.\nExisting projects can import directly from ingestion_schemas without modifying schemas.py.\nCandidate facts go in facts/candidates.json; the original facts/facts.json and inputs/facts.csv remain compatible with the existing CLI.\nThe new registries are templates, not automatically populated. The PDF and table readers are basic utilities; agent ingestion, approvals, configuration loading and new CLI commands are not implemented, with one exception: writing guides are read by `paperkit rules extract` (see the README).\nThe original wiki reads wiki/<citation-key>.md; wiki/sources and wiki/concepts are reserved for future migration.\nInstall PDF parsing support with python -m pip install pymupdf.\n'
 
 FILES['src/paperkit/schemas.py'] += "\n# Extended ingestion schemas\nfrom .ingestion_schemas import (ScientificFact, MetricSpec, TableSpec, TableManifest, SourceDocument, EvidenceItem, LiteratureRecord, ConceptRecord, WritingRule, RuleSet, AgentConfig, AgentRun)\n"
 FILES['README.md'] += "\n## Extended ingestion layout\n\nSee [docs/ingestion.md](docs/ingestion.md) for new input folders and current implementation limits.\n"
@@ -1982,6 +2490,7 @@ from pathlib import Path
 import yaml
 
 from . import agents, zotero
+from .ingestion import rules_ingest
 from .schemas import PaperSpec
 
 MIN_WORDS = 30   # below this, a Methods or Results file counts as not filled in
@@ -2168,6 +2677,13 @@ def check_inputs(root: str | Path) -> list[Check]:
         pdfs = _count(root / ".papers", ("*.pdf", "*.PDF"))
         checks.append(Check("papers", ".papers/", "Source PDFs", "optional", pdfs > 0,
                             f"{pdfs} PDF(s)" if pdfs else "none", "the papers you cite, for building source pages"))
+    if (root / rules_ingest.GUIDES).is_dir():
+        found = rules_ingest.state(root)
+        detail = ("none" if not found["guides"] and not found["candidates"]
+                  else f"{found['guides']} file(s), no rules yet: run `paperkit rules extract`" if not found["candidates"]
+                  else f"{found['guides']} file(s), {found['approved']} of {found['candidates']} rule(s) approved")
+        checks.append(Check("guides", ".writing_guides/", "Writing guides", "optional", found["approved"] > 0, detail,
+                            "the journal's guide for authors and reporting guidelines, as PDF; then `paperkit rules extract`"))
     for sec_id in _section_ids(root):
         draft = root / "inputs" / f"{sec_id}_draft.md"
         if draft.is_file():
@@ -2393,6 +2909,7 @@ import sys
 from pathlib import Path
 
 from . import agents, build, dryrun, env, extract, facts, orchestrator, preflight, zotero
+from .ingestion import rules_ingest
 from .schemas import ClaimTable, Issue
 from .validators import blocking
 
@@ -2415,6 +2932,7 @@ MENU = {
     "7": "Build the paper and the report",
     "8": "Show section statuses",
     "9": "Choose the model provider and test the connection",
+    "r": "Writing rules from the guides in .writing_guides  (reading them calls the API)",
     "q": "Quit",
 }
 
@@ -2923,8 +3441,23 @@ def act_models(ui: UI, root: Path) -> None:
         ui.out("All models answered." if show_ping(ui) else "At least one model did not answer: see above.")
 
 
+def act_rules(ui: UI, root: Path) -> None:
+    found = rules_ingest.state(root)
+    ui.out(f"{found['guides']} guide file(s) in {rules_ingest.GUIDES}/, {found['candidates']} candidate rule(s), "
+           f"{found['approved']} approved.")
+    choice = ui.choose("What now?", {"x": "read the guides and propose rules (calls the API)",
+                                     "a": "go through the rules that are not approved yet",
+                                     "l": "list all rules", "b": "back"}, default="b")
+    if choice == "x" and _confirm_api(ui, "rules"):
+        rules_ingest.run(root, "extract", out=ui.out)
+    elif choice == "a":
+        rules_ingest.run(root, "approve", out=ui.out, ask=ui.ask)
+    elif choice == "l":
+        rules_ingest.run(root, "list", out=ui.out)
+
+
 ACTIONS = {"1": act_inputs, "2": act_dry_run, "3": act_plan, "4": act_approve,
-           "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models}
+           "5": act_run, "6": act_validate, "7": act_build, "8": act_status, "9": act_models, "r": act_rules}
 
 
 def menu(ui: UI, root: Path) -> int:
@@ -3989,7 +4522,7 @@ def test_ping_reports_each_model(project, monkeypatch, capsys):
     monkeypatch.setattr(nvidia, "post", stand_in_endpoint([]))
     assert main(["--root", str(project), "ping"]) == 0
     out = capsys.readouterr().out
-    assert "(planner, writer, facts): ok" in out and "other/model  (reviewer): ok" in out
+    assert "(planner, writer, facts, rules): ok" in out and "other/model  (reviewer): ok" in out
 
     def refuse(url, key, body):
         raise nvidia.ApiError(401, "Unauthorized")
@@ -4232,6 +4765,306 @@ def run(root: str | Path, what: str = "all", force: bool = False, out=print) -> 
     if code == 0:
         out("Read both files and correct them before `paperkit plan`: a model drafted them.")
     return code
+'''
+
+
+# ----------------------------------------------------------------------------
+# tests/test_rules.py
+# ----------------------------------------------------------------------------
+FILES['tests/test_rules.py'] = r'''
+"""Writing guides -> rules: reading, checking, approval and use in the pipeline.
+
+No network: the model is replaced by a function that returns prepared answers.
+"""
+import json
+
+import pytest
+
+from paperkit import agents, orchestrator, preflight, wizard
+from paperkit.__main__ import main
+from paperkit.ingestion import rules_ingest
+from paperkit.ingestion.rules_ingest import ProposedRule, RuleList
+from paperkit.schemas import Claim, ClaimList, Draft, Review
+from paperkit.validators import blocking
+
+SPEC = """title: Test paper
+design: observational
+max_rounds: 3
+sections:
+  - id: introduction
+    title: Introduction
+    max_words: 200
+    required_headings: [Background]
+  - id: discussion
+    title: Discussion
+    max_words: 200
+    required_headings: [Principal findings, Interpretation]
+"""
+PAGE_1 = ("Instructions for authors\n\nManuscripts are submitted through the online portal. "
+          "The fee is paid on accept-\nance of the paper.")
+PAGE_2 = ("Discussion\n\nThe Discussion should begin with a brief summary\nof the main findings. "
+          "Authors must not use the words “novel” or “paradigm shift” anywhere in the text.\n\n"
+          "Limitations of the study must be stated in a separate paragraph.")
+SUMMARY = ProposedRule(instruction="Open the Discussion with a short summary of the main findings.",
+                       quote="The Discussion should begin with a brief summary of the main findings.",
+                       category="structure", sections=["discussion"], priority="recommended")
+BANNED = ProposedRule(instruction="Do not use the words novel or paradigm shift.",
+                      quote='Authors must not use the words "novel" or "paradigm shift" anywhere in the text',
+                      category="language", sections=["all"], priority="required",
+                      avoid_terms=["novel", "paradigm shift", "groundbreaking"])      # the last one is invented
+LIMITS = ProposedRule(instruction="State the limitations in their own paragraph.",
+                      quote="Limitations of the study must be stated", category="odd", sections=["Discussion"],
+                      priority="MUST")
+INVENTED = ProposedRule(instruction="Keep the abstract under 250 words.",
+                        quote="The abstract must not exceed 250 words.", sections=["abstract"])
+TOO_SHORT = ProposedRule(instruction="Mention the main findings.", quote="main findings")
+FEE = ProposedRule(instruction="Pay the fee when the paper is accepted.",
+                   quote="The fee is paid on acceptance of the paper.")
+
+FACTS = {"F1": {"text": "r = 0.31", "source": "Table 2"}, "F2": {"text": "412", "source": "Methods"}}
+BIB = "@article{smith2020,\n  title = {A study},\n  author = {Smith, A.},\n  year = {2020},\n}\n"
+CLAIMS = [
+    Claim(id="C1", text="X is associated with Y.", category="OBSERVED", fact_ids=["F1", "F2"]),
+    Claim(id="C2", text="X tracks Y.", category="INFERRED", cite_keys=["smith2020"]),
+]
+GOOD = """## Principal findings
+
+We observed an association between X and Y ({{F1}}) among {{F2}} participants. <!-- C1 -->
+
+## Interpretation
+
+This suggests that X tracks Y, consistent with earlier work [@smith2020]. <!-- C2 -->
+"""
+WITH_BANNED_TERM = GOOD.replace("consistent with earlier work", "a paradigm shift consistent with earlier work")
+
+
+@pytest.fixture
+def project(tmp_path, monkeypatch):
+    for name in ["PAPERKIT_GUIDE_WORDS", "PAPERKIT_PROVIDER", "PAPERKIT_MODEL", "ANTHROPIC_API_KEY", "PAPERKIT_ENV_FILE"]:
+        monkeypatch.setenv(name, "")
+    root = tmp_path / "repo" / "project"
+    for folder in ["facts", "refs", "inputs", "wiki", "rules", ".writing_guides/journal"]:
+        (root / folder).mkdir(parents=True)
+    (root / "paper.yaml").write_text(SPEC, encoding="utf-8")
+    (root / "facts" / "facts.json").write_text(json.dumps(FACTS), encoding="utf-8")
+    (root / "refs" / "library.bib").write_text(BIB, encoding="utf-8")
+    (root / "rules" / "candidates.json").write_text("\n[]\n", encoding="utf-8")       # as the scaffold leaves them
+    (root / "rules" / "active_rules.json").write_text("\n[]\n", encoding="utf-8")
+    (root / ".writing_guides" / "journal" / ".gitkeep").touch()
+    (root / ".writing_guides" / "journal" / "authors.txt").write_text(PAGE_1 + "\f" + PAGE_2, encoding="utf-8")
+    yield root
+    agents.LLM = None
+    agents.CONFIG = {}
+
+
+def proposes(*rules, calls=None):
+    """A model that proposes the same rules for every part of a guide."""
+    def llm(system, user, schema):
+        assert schema is RuleList
+        if calls is not None:
+            calls.append(user)
+        return RuleList(rules=list(rules))
+    return llm
+
+
+def never(system, user, schema):
+    raise AssertionError("the model must not be called")
+
+
+def stored(root, name="candidates"):
+    return json.loads((root / "rules" / f"{name}.json").read_text(encoding="utf-8"))
+
+
+def test_a_rule_is_kept_only_if_its_quote_is_in_the_guide(project):
+    agents.LLM = proposes(SUMMARY, BANNED, INVENTED, LIMITS, TOO_SHORT, FEE)
+    got = rules_ingest.extract(project)
+    rules = {r["id"]: r for r in stored(project)}
+    assert list(rules) == ["R1", "R2", "R3", "R4"] and got["new"] == 4
+    assert all(r["source_file"] == ".writing_guides/journal/authors.txt" and r["group"] == "journal"
+               and r["approved"] is False for r in rules.values())
+    assert rules["R1"]["source_page"] == 2 and rules["R1"]["sections"] == ["discussion"]    # the page comes from code
+    assert rules["R2"]["avoid_terms"] == ["novel", "paradigm shift"]                        # the invented term is gone
+    assert rules["R2"]["severity"] == "blocking" and rules["R2"]["validation_method"] == "python"
+    assert (rules["R3"]["priority"], rules["R3"]["category"], rules["R3"]["sections"]) == ("recommended", "language", ["discussion"])
+    assert rules["R4"]["source_page"] == 1                         # "accept-ance" over a line break is still found
+    assert len(got["dropped"]) == 2 and "its quote is not in the guide" in got["dropped"][0]
+    assert "too short to check" in got["dropped"][1]
+    assert stored(project, "active_rules") == []                   # nothing is used before a person approves it
+
+
+def test_a_second_run_asks_nothing_again_and_keeps_ids_edits_and_approvals(project):
+    calls = []
+    agents.LLM = proposes(SUMMARY, BANNED, calls=calls)
+    rules_ingest.extract(project)
+    assert len(calls) == 1
+    assert main(["--root", str(project), "rules", "approve", "r1"]) == 0
+    edited = stored(project)
+    edited[1]["instruction"] = "Never write novel or paradigm shift."                       # a correction by hand
+    (project / "rules" / "candidates.json").write_text(json.dumps(edited), encoding="utf-8")
+
+    agents.LLM = never                                             # the saved answer is used
+    said = []
+    got = rules_ingest.extract(project, say=said.append)
+    assert "answer kept from an earlier run" in said[0] and got["new"] == 0
+    after = stored(project)
+    assert [(r["id"], r["approved"]) for r in after] == [("R1", True), ("R2", False)]
+    assert after[1]["instruction"] == "Never write novel or paradigm shift."
+    assert [r["id"] for r in stored(project, "active_rules")] == ["R1"]
+
+    agents.LLM = proposes(SUMMARY, LIMITS, calls=calls)             # --fresh asks again
+    got = rules_ingest.extract(project, fresh=True)
+    assert len(calls) == 2 and got["new"] == 1
+    assert [(r["id"], r["approved"]) for r in stored(project)] == [("R1", True), ("R3", False)]
+
+
+def test_a_failed_part_is_reported_and_only_that_part_is_asked_again(project, monkeypatch, capsys):
+    monkeypatch.setenv("PAPERKIT_GUIDE_WORDS", "10")                # every page becomes its own part
+    calls = []
+
+    def flaky(system, user, schema):
+        calls.append(user)
+        if "[page 2]" in user:
+            raise RuntimeError("NVIDIA API, model x: HTTP 504")
+        return RuleList(rules=[FEE])
+
+    agents.LLM = flaky
+    assert main(["--root", str(project), "rules", "extract"]) == 1
+    out = capsys.readouterr().out
+    assert "part 1 of 2 (page 1)" in out and "failed: .writing_guides/journal/authors.txt, page 2: RuntimeError" in out
+    assert "1 candidate(s) from 1 guide file(s)" in out and [r["id"] for r in stored(project)] == ["R1"]
+
+    calls.clear()
+    agents.LLM = proposes(SUMMARY, calls=calls)
+    assert main(["--root", str(project), "rules", "extract"]) == 0
+    assert len(calls) == 1 and "[page 2]" in calls[0]              # page 1 was not asked again
+    assert [r["id"] for r in stored(project)] == ["R1", "R2"]
+
+
+def test_approve_reject_and_list(project, capsys):
+    assert main(["--root", str(project), "rules", "list"]) == 0 and "No rules yet" in capsys.readouterr().out
+    agents.LLM = proposes(SUMMARY, BANNED, LIMITS)
+    assert main(["--root", str(project), "rules", "extract"]) == 0
+    assert "Nothing is used until you approve it" in capsys.readouterr().out
+
+    assert main(["--root", str(project), "rules", "approve", "R1", "r2"]) == 0
+    assert [r["id"] for r in stored(project, "active_rules")] == ["R1", "R2"]
+    assert main(["--root", str(project), "rules", "reject", "R2"]) == 0
+    assert [r["id"] for r in stored(project, "active_rules")] == ["R1"]
+    assert main(["--root", str(project), "rules", "approve", "R9"]) == 1
+    assert "No such rule: R9" in capsys.readouterr().out
+    assert main(["--root", str(project), "rules", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "[x] R1  recommended, discussion:" in out and "[ ] R2  required, all:" in out
+    assert "code will flag: novel, paradigm shift" in out and "(.writing_guides/journal/authors.txt, p. 2)" in out
+    assert main(["--root", str(project), "rules", "approve", "--all"]) == 0
+    assert len(stored(project, "active_rules")) == 3
+
+
+def test_review_asks_about_each_rule_that_is_not_approved_yet(project):
+    agents.LLM = proposes(SUMMARY, BANNED, LIMITS)
+    rules_ingest.extract(project)
+    answers, printed = iter(["y", "n", "y"]), []
+    assert rules_ingest.run(project, "approve", ask=lambda prompt: next(answers), out=printed.append) == 0
+    assert [r["id"] for r in stored(project, "active_rules")] == ["R1", "R3"]
+    assert "Rule 1 of 3" in printed and "2 rule(s) approved." in printed
+
+    answers = iter(["a"])                                           # one rule is left: approve the rest
+    assert rules_ingest.run(project, "approve", ask=lambda prompt: next(answers), out=printed.append) == 0
+    assert len(stored(project, "active_rules")) == 3
+
+
+def pipeline_model(drafts, seen):
+    drafts = iter(drafts)
+
+    def llm(system, user, schema):
+        seen.append((schema.__name__, user))
+        if schema is ClaimList:
+            return ClaimList(claims=CLAIMS)
+        if schema is Draft:
+            return Draft(markdown=next(drafts))
+        if schema is Review:
+            return Review(issues=[])
+        raise AssertionError(schema)
+    return llm
+
+
+def test_approved_rules_reach_the_writer_the_reviewer_and_the_gate(project):
+    agents.LLM = proposes(SUMMARY, BANNED, LIMITS)
+    rules_ingest.extract(project)
+    p = orchestrator.Project(project)
+    assert p.rules("discussion") == []                              # candidates alone change nothing
+    assert main(["--root", str(project), "rules", "approve", "R1", "R2"]) == 0
+    assert [r.id for r in p.rules("discussion")] == ["R1", "R2"]
+    assert [r.id for r in p.rules("introduction")] == ["R2"]        # R1 is for the Discussion only
+
+    seen, said = [], []
+    agents.LLM = pipeline_model([WITH_BANNED_TERM, GOOD], seen)
+    orchestrator.plan(p, "discussion")
+    orchestrator.approve(p, "discussion")
+    assert orchestrator.run_section(p, "discussion", said.append) == "DONE"
+    text = "\n".join(said)
+    assert "discussion: 2 approved writing rule(s) apply" in text
+    assert "gates    1 problem(s), back to the writer:" in text and "[rules] R2: avoid 'paradigm shift'" in text
+
+    writer = next(user for name, user in seen if name == "Draft")
+    reviewer = next(user for name, user in seen if name == "Review")
+    for prompt in (writer, reviewer):
+        assert "<writing_rules>" in prompt and "Open the Discussion with a short summary" in prompt
+        assert "State the limitations" not in prompt                # R3 was never approved
+    planner = next(user for name, user in seen if name == "ClaimList")
+    assert "<writing_rules>" not in planner
+
+    bad = project / "bad.md"
+    bad.write_text(WITH_BANNED_TERM, encoding="utf-8")
+    issues = blocking(orchestrator.validate(p, "discussion", bad))
+    assert [i.gate for i in issues] == ["rules"] and "R2" in issues[0].message
+    assert main(["--root", str(project), "rules", "reject", "R2"]) == 0
+    assert orchestrator.validate(orchestrator.Project(project), "discussion", bad) == []
+
+
+def test_a_real_pdf_is_read_page_by_page(project):
+    pymupdf = pytest.importorskip("pymupdf")
+    (project / ".writing_guides" / "journal" / "authors.txt").unlink()
+    doc = pymupdf.open()
+    for text in (PAGE_1, PAGE_2.replace("“", '"').replace("”", '"')):
+        page = doc.new_page(width=300, height=500)                  # narrow, so sentences wrap over lines
+        page.insert_textbox(pymupdf.Rect(30, 30, 270, 470), text, fontsize=10)
+    (project / ".writing_guides" / "reporting").mkdir()
+    doc.save(project / ".writing_guides" / "reporting" / "checklist.pdf")
+
+    pages = rules_ingest.read_guide(project / ".writing_guides" / "reporting" / "checklist.pdf")
+    assert [number for number, _ in pages] == [1, 2] and "brief summary of the main findings" in pages[1][1]
+    agents.LLM = proposes(SUMMARY, BANNED, INVENTED)
+    got = rules_ingest.extract(project)
+    assert [(r.id, r.source_page, r.group) for r in got["rules"]] == [("R1", 2, "reporting"), ("R2", 2, "reporting")]
+    assert got["rules"][0].source_file == ".writing_guides/reporting/checklist.pdf" and len(got["dropped"]) == 1
+
+
+def test_no_guides_and_a_broken_rule_file_are_said_plainly(project, capsys):
+    (project / ".writing_guides" / "journal" / "authors.txt").unlink()
+    agents.LLM = never
+    assert main(["--root", str(project), "rules", "extract"]) == 1
+    assert "No guides found. Put PDF, .md or .txt files in .writing_guides/journal" in capsys.readouterr().out
+    (project / "rules" / "candidates.json").write_text("{not json", encoding="utf-8")
+    assert main(["--root", str(project), "rules", "list"]) == 1
+    assert "rules/candidates.json is not valid" in capsys.readouterr().out
+
+
+def test_checklist_and_menu_show_the_guides(project):
+    check = next(c for c in preflight.check_inputs(project) if c.key == "guides")
+    assert not check.ok and check.level == "optional" and "1 file(s), no rules yet" in check.detail
+
+    feed, printed = iter(["x", "y"]), []                            # read the guides, and yes to the API call
+    ui = wizard.UI(ask=lambda prompt="": next(feed), out=lambda text="": printed.append(str(text)), color=False)
+    agents.LLM = proposes(SUMMARY, BANNED)
+    wizard.act_rules(ui, project)
+    assert any("2 candidate(s) from 1 guide file(s)" in row for row in printed)
+
+    feed = iter(["a", "y", "n"])                                    # review: approve the first, leave out the second
+    wizard.act_rules(ui, project)
+    assert [r["id"] for r in stored(project, "active_rules")] == ["R1"]
+    check = next(c for c in preflight.check_inputs(project) if c.key == "guides")
+    assert check.ok and "1 of 2 rule(s) approved" in check.detail
 '''
 
 

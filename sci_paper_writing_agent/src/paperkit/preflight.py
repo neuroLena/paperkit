@@ -16,6 +16,7 @@ from pathlib import Path
 import yaml
 
 from . import agents, zotero
+from .ingestion import rules_ingest
 from .schemas import PaperSpec
 
 MIN_WORDS = 30   # below this, a Methods or Results file counts as not filled in
@@ -202,6 +203,13 @@ def check_inputs(root: str | Path) -> list[Check]:
         pdfs = _count(root / ".papers", ("*.pdf", "*.PDF"))
         checks.append(Check("papers", ".papers/", "Source PDFs", "optional", pdfs > 0,
                             f"{pdfs} PDF(s)" if pdfs else "none", "the papers you cite, for building source pages"))
+    if (root / rules_ingest.GUIDES).is_dir():
+        found = rules_ingest.state(root)
+        detail = ("none" if not found["guides"] and not found["candidates"]
+                  else f"{found['guides']} file(s), no rules yet: run `paperkit rules extract`" if not found["candidates"]
+                  else f"{found['guides']} file(s), {found['approved']} of {found['candidates']} rule(s) approved")
+        checks.append(Check("guides", ".writing_guides/", "Writing guides", "optional", found["approved"] > 0, detail,
+                            "the journal's guide for authors and reporting guidelines, as PDF; then `paperkit rules extract`"))
     for sec_id in _section_ids(root):
         draft = root / "inputs" / f"{sec_id}_draft.md"
         if draft.is_file():

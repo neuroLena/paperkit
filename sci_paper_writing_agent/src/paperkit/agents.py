@@ -110,7 +110,7 @@ class Ping(BaseModel):
 def ping_all() -> list[tuple[str, str, str, str]]:
     """One tiny request per distinct provider and model in use: (agents, provider, model, 'ok' or the error)."""
     routes: dict[tuple[str, str], list[str]] = {}
-    for kind in (*PIPELINE_AGENTS, "facts"):             # facts: the model behind `paperkit extract facts`
+    for kind in (*PIPELINE_AGENTS, "facts", "rules"):    # the models behind `extract facts` and `rules extract`
         routes.setdefault(route(kind), []).append(kind)
     rows = []
     for (provider, model), kinds in routes.items():
@@ -206,7 +206,8 @@ Code checks the draft and rejects it on any violation:
   SPECULATIVE: "may", "might", "one possibility is".
 - No "novel", "first", "proves", "clearly", "robust". Never "no effect": say "we did not detect".
 - If something you need is missing, write [AUTHOR: what is missing] or [NEEDS SOURCE: what for]. Do not fill the gap yourself.
-- If <starting_draft> is given, follow it: keep text marked [KEEP] word for word (it still needs its claim tag), make the change at each [CHANGE: ...], and write each [WRITE: ...] from the claims. Never copy the markers [KEEP], [CHANGE: ...] or [WRITE: ...] into your draft."""
+- If <starting_draft> is given, follow it: keep text marked [KEEP] word for word (it still needs its claim tag), make the change at each [CHANGE: ...], and write each [WRITE: ...] from the claims. Never copy the markers [KEEP], [CHANGE: ...] or [WRITE: ...] into your draft.
+- If <writing_rules> is given, follow every rule in it: they come from the journal's and other writing guides, and the author approved them. Where one of them conflicts with the rules above, the rules above win."""
 
 OBSERVATIONAL = """
 - The design is observational: no causal wording (cause, lead to, result in, effect of, impact, drive) outside paragraphs tagged only with SPECULATIVE or ASSUMED claims."""
@@ -214,7 +215,7 @@ OBSERVATIONAL = """
 
 def write_section(sec: SectionSpec, *, design: str, claims: Sequence[Claim], fact_reg: dict,
                   wiki_pages: dict[str, str], prev_draft: str = "", issues: Sequence[Issue] = (),
-                  starting_draft: str = "") -> str:
+                  starting_draft: str = "", rules: Sequence[dict] = ()) -> str:
     system = WRITER + (OBSERVATIONAL if design == "observational" else "")
     user = "\n\n".join([
         _tag("section", _json(sec.model_dump())),
@@ -222,6 +223,8 @@ def write_section(sec: SectionSpec, *, design: str, claims: Sequence[Claim], fac
         _tag("facts", _json(fact_reg)),
         _tag("sources", "\n\n".join(f"## {k}\n{v}" for k, v in wiki_pages.items())),
     ])
+    if rules:
+        user += "\n\n" + _tag("writing_rules", _json(list(rules)))
     if starting_draft:
         user += "\n\n" + _tag("starting_draft", starting_draft)
     if prev_draft:
@@ -242,13 +245,15 @@ Report an issue with gate set to one of:
 - alternative: an obvious alternative explanation left unaddressed
 - assumption: an assumption the argument relies on but does not state
 - citation: a cited source whose page does not support the sentence; a missing page counts
+- rule: the draft breaks a rule in <writing_rules>, if that block is given. Name the rule id in the message. This one is blocking only if the rule's priority is "required". Placeholders, claim tags and [@key] citations are replaced later and never break a rule.
 
 For each issue give severity ("blocking" if the paper would be wrong or misleading, otherwise "warning"), a message saying what is wrong, and the exact sentence as excerpt.
 If the draft is sound, return an empty list."""
 
 
 def review_section(sec: SectionSpec, *, design: str, methods: str, results: str, claims: Sequence[Claim],
-                   fact_reg: dict, wiki_pages: dict[str, str], draft: str) -> list[Issue]:
+                   fact_reg: dict, wiki_pages: dict[str, str], draft: str,
+                   rules: Sequence[dict] = ()) -> list[Issue]:
     user = "\n\n".join([
         _tag("section", _json(sec.model_dump())),
         _tag("study_design", design),
@@ -257,6 +262,7 @@ def review_section(sec: SectionSpec, *, design: str, methods: str, results: str,
         _tag("claims", _json([c.model_dump() for c in claims])),
         _tag("facts", _json(fact_reg)),
         _tag("sources", "\n\n".join(f"## {k}\n{v}" for k, v in wiki_pages.items())),
+        *([_tag("writing_rules", _json(list(rules)))] if rules else []),
         _tag("draft", draft),
     ])
     review = _ask("reviewer", REVIEWER, user, Review)
